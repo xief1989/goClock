@@ -1,0 +1,11 @@
+# 编译产物
+GoClock.exe
+*.exe
+
+# Go 测试与覆盖率
+*.test
+*.out
+
+# 编辑器
+.vscode/
+.idea/
