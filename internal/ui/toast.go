@@ -494,30 +494,35 @@ func (t *toast) tipText() string {
 	return fmt.Sprintf("%d 秒后自动关闭", t.remain)
 }
 
+// tickCountdown 推进一次倒计时，返回新的剩余秒数、暂停状态以及是否该关闭弹窗。
+//
+// 鼠标停在卡片上时倒计时暂停，剩余秒数保持不变；
+// 移开之后从暂停处继续，而不是重新从头计时。
+func tickCountdown(remain int, hovered bool) (newRemain int, paused, shouldClose bool) {
+	if hovered {
+		return remain, true, false
+	}
+	remain--
+	return remain, false, remain <= 0
+}
+
 // countdownStep 每秒在界面线程上执行一次，负责推进倒计时并在归零时关闭弹窗。
 func (t *toast) countdownStep() {
 	if t.closed {
 		return
 	}
 
-	// 鼠标停在卡片上时暂停倒计时；移开后从暂停处继续，而不是重新计时。
-	if t.hovered() {
-		if !t.paused {
-			t.paused = true
-			t.widget.Invalidate()
-		}
-		return
-	}
-	if t.paused {
-		t.paused = false
-	}
+	remain, paused, shouldClose := tickCountdown(t.remain, t.hovered())
+	changed := remain != t.remain || paused != t.paused
+	t.remain, t.paused = remain, paused
 
-	t.remain--
-	if t.remain <= 0 {
+	if shouldClose {
 		t.close()
 		return
 	}
-	t.widget.Invalidate()
+	if changed && t.widget != nil {
+		t.widget.Invalidate()
+	}
 }
 
 // hovered 判断鼠标指针当前是否落在弹窗范围内。
