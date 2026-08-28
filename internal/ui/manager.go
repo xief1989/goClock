@@ -38,17 +38,22 @@ func (m *alarmModel) Value(row, col int) interface{} {
 	case 2:
 		return a.TimeText()
 	case 3:
+		if a.RequireAck {
+			return "需确认"
+		}
+		return "—"
+	case 4:
 		if !a.Enabled {
 			return "已停用"
 		}
 		t, ok := m.nextAt(a.ID)
 		return humanTime(t, ok)
-	case 4:
+	case 5:
 		if a.LastFire.IsZero() {
 			return "—"
 		}
 		return humanTime(a.LastFire, true)
-	case 5:
+	case 6:
 		return a.Message
 	default:
 		return ""

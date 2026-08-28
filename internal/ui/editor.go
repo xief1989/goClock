@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ type editor struct {
 	messageEdit  *walk.TextEdit
 	repeatCombo  *walk.ComboBox
 	enabledCheck *walk.CheckBox
+	ackCheck     *walk.CheckBox
 
 	dateRow  *walk.Composite
 	dateEdit *walk.DateEdit
@@ -148,6 +150,11 @@ func RunAlarmEditor(owner walk.Form, a *alarm.Alarm, title string) bool {
 				},
 			}),
 
+			dcl.CheckBox{
+				AssignTo: &e.ackCheck,
+				Text:     fmt.Sprintf("必须手动关闭：没点掉的话，每隔 %d 分钟再提醒一次", int(nagInterval.Minutes())),
+				Checked:  a.RequireAck,
+			},
 			dcl.CheckBox{
 				AssignTo: &e.enabledCheck,
 				Text:     "启用这条提醒",
@@ -306,6 +313,7 @@ func (e *editor) accept(a *alarm.Alarm) {
 	draft.Title = strings.TrimSpace(e.titleEdit.Text())
 	draft.Message = strings.TrimSpace(e.messageEdit.Text())
 	draft.Enabled = e.enabledCheck.Checked()
+	draft.RequireAck = e.ackCheck.Checked()
 	draft.Repeat = e.currentRepeat()
 	draft.Hour = int(e.hourEdit.Value())
 	draft.Minute = int(e.minuteEdit.Value())

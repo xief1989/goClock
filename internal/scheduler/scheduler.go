@@ -27,6 +27,8 @@ type Event struct {
 	Title string
 	// Message 是提醒正文。
 	Message string
+	// RequireAck 表示这条提醒必须由用户手动关闭。
+	RequireAck bool
 	// At 是本次触发的时刻，仅在 Fired 为真时有意义。
 	At time.Time
 	// Fired 表示需要弹出提醒。
@@ -127,7 +129,7 @@ func (s *Scheduler) tick(now time.Time) {
 			continue
 		}
 
-		ev := Event{ID: a.ID, Title: a.Title, Message: a.Message, At: now}
+		ev := Event{ID: a.ID, Title: a.Title, Message: a.Message, RequireAck: a.RequireAck, At: now}
 		if now.Sub(due) <= missTolerance {
 			a.LastFire = now
 			ev.Fired = true

@@ -12,6 +12,7 @@ A desktop reminder that lives in the Windows tray. When a reminder is due, a car
 - **Bottom-right toast** — a borderless card pinned to the corner of the work area. It stays on top but **never steals focus**, so it will not interrupt what you are typing. Closes after a 15-second countdown.
 - **Dismiss with a click** — clicking anywhere on the card closes it; the cursor turns into a hand when you hover.
 - **Hover to pause** — the countdown pauses while the pointer rests on the card and resumes from where it stopped, rather than restarting.
+- **Acknowledgement required** (per reminder) — when enabled, letting the card time out does not count as dealing with it: the reminder comes back every 5 minutes until you click it away.
 - **Several at once** — reminders that fire together stack upward, up to 4 on screen.
 - **Recurrence** — once / daily / weekdays / weekly (any set of weekdays) / monthly (any set of dates, including the last day of the month) / yearly / every N minutes.
 - **Run at login** — written to the current user's registry, no administrator rights needed.
@@ -28,7 +29,8 @@ Run `GoClock.exe`. The first launch opens the management window and writes one s
 | Enable or disable a reminder | Tick the checkbox in the leftmost column |
 | Preview a toast | Select a row and click 预览弹窗 ("preview toast") |
 | Run at login | Checkbox in the top-right corner, or the tray context menu |
-| Dismiss a toast | Click anywhere on the card, or leave it — it closes after 15 seconds |
+| Dismiss a toast | Click anywhere on the card, or leave it — it hides after 15 seconds |
+| See how many are unacknowledged | Hover the tray icon; the tooltip counts them |
 | Quit | Tray context menu → 退出 ("quit"). Closing the management window only hides it |
 
 ### Recurrence in detail
@@ -38,6 +40,20 @@ Run `GoClock.exe`. The first launch opens the management window and writes one s
 - Entering `31` for a monthly reminder fires only in months that have 31 days; shorter months are skipped.
 - **Yearly** — pick a month and a date. Dates that only exist in leap years, such as February 29th, are scheduled correctly.
 - **Every N minutes** — counts from the moment the program starts.
+
+### Requiring acknowledgement
+
+Each reminder has a 必须手动关闭 ("must be closed by hand") checkbox in the editor. The 关闭方式 ("dismissal") column in the list shows which reminders have it on.
+
+With it enabled the card's hint changes to 点击确认 ("click to acknowledge"), because for these reminders the 15-second countdown only **hides** the card:
+
+- You click the card → done, that occurrence is finished.
+- You don't, and it fades on its own → it comes back 5 minutes later, marked 第 N 次 ("attempt N"), and keeps coming back until you click it.
+- The same alarm falls due again in the meantime → the counter restarts at 1 rather than piling up a second entry.
+
+Disabling the alarm, deleting it, or unticking the box drops any outstanding acknowledgement along with it.
+
+Outstanding acknowledgements are **not persisted** — quitting or restarting clears them, so you never get a pile of them at login.
 
 ### Missed reminders
 
@@ -83,6 +99,7 @@ internal/
     manager.go             table model behind the reminder list
     editor.go              add / edit dialog
     toast.go               the bottom-right toast (the whole card is custom-drawn)
+    pending.go             queue of reminders awaiting acknowledgement (unit-tested)
 tools/genicon/             small tool that writes assets\icon.ico
 ```
 

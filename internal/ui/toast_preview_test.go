@@ -35,26 +35,33 @@ func TestRenderToastPreview(t *testing.T) {
 
 	firedAt := time.Date(2026, 8, 26, 14, 30, 0, 0, time.Local)
 	cases := []struct {
-		name    string
-		title   string
-		message string
-		paused  bool
+		name       string
+		title      string
+		message    string
+		paused     bool
+		requireAck bool
+		attempt    int
 	}{
-		{"01-short", "喝水提醒", "起来接杯水。", false},
-		{"02-normal", "测试提醒 · 弹窗效果", "这是一条用于验证右下角弹窗的提醒内容，文字较长时会自动折行显示，15 秒后自动关闭。", false},
-		{"03-empty", "只有标题的提醒", "", false},
-		{"04-overflow", "超长内容会被裁掉", strings.Repeat("这一段内容很长，超出四行的部分不再显示。", 6), false},
-		{"05-longtitle", "标题特别长的时候应该以省略号结尾而不是把卡片撑宽", "标题过长时用省略号收尾。", false},
-		{"06-paused", "鼠标悬停时暂停", "鼠标停在卡片上时倒计时暂停，移开后从暂停处继续。", true},
+		{"01-short", "喝水提醒", "起来接杯水。", false, false, 1},
+		{"02-normal", "测试提醒 · 弹窗效果", "这是一条用于验证右下角弹窗的提醒内容，文字较长时会自动折行显示，15 秒后自动关闭。", false, false, 1},
+		{"03-empty", "只有标题的提醒", "", false, false, 1},
+		{"04-overflow", "超长内容会被裁掉", strings.Repeat("这一段内容很长，超出四行的部分不再显示。", 6), false, false, 1},
+		{"05-longtitle", "标题特别长的时候应该以省略号结尾而不是把卡片撑宽", "标题过长时用省略号收尾。", false, false, 1},
+		{"06-paused", "鼠标悬停时暂停", "鼠标停在卡片上时倒计时暂停，移开后从暂停处继续。", true, false, 1},
+		{"07-ack", "需要手动关闭", "这条提醒必须点掉才算处理完毕。", false, true, 1},
+		{"08-ack-repeat", "第三次催你", "没点掉的话每隔 5 分钟就会再来一次。", false, true, 3},
+		{"09-ack-paused", "需确认且悬停", "鼠标停在上面时倒计时暂停。", true, true, 2},
 	}
 
 	for _, c := range cases {
 		item := &toast{
-			title:   c.title,
-			message: c.message,
-			firedAt: firedAt,
-			remain:  9,
-			paused:  c.paused,
+			title:      c.title,
+			message:    c.message,
+			firedAt:    firedAt,
+			remain:     9,
+			paused:     c.paused,
+			requireAck: c.requireAck,
+			attempt:    c.attempt,
 		}
 		if err := renderPreview(item, filepath.Join(dir, c.name+".png")); err != nil {
 			t.Fatalf("%s 渲染失败：%v", c.name, err)

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/lxn/walk"
@@ -29,11 +30,15 @@ type App struct {
 	ni     *walk.NotifyIcon
 	toasts *toastManager
 
+	// pending 保存开启了「必须手动关闭」的提醒中，还没被用户点掉的那些。
+	pending *reminderQueue
+
 	autoCheck  *walk.CheckBox
 	autoAction *walk.Action
 
 	// quitting 用于区分「用户关闭窗口」与「真正退出程序」。
-	quitting bool
+	// 后台协程会读它，所以用原子变量。
+	quitting atomic.Bool
 }
 
 // NewApp 创建应用实例并加载已保存的闹钟。
@@ -52,8 +57,10 @@ func NewApp() (*App, error) {
 		store:    store,
 		alarms:   list,
 		toasts:   &toastManager{},
+		pending:  newReminderQueue(),
 		firstRun: firstRun,
 	}
+	a.toasts.onClosed = a.onToastClosed
 	a.model = &alarmModel{
 		items:    list,
 		nextAt:   a.nextAt,
@@ -87,6 +94,8 @@ func (a *App) Run() error {
 
 	// 每分钟刷新一次列表，让「下次提醒」列保持最新。
 	go a.refreshLoop()
+	// 轮询等待确认的提醒，到点就再弹一次。
+	go a.nagLoop()
 
 	a.mw.Run()
 	return nil
@@ -161,6 +170,7 @@ func (a *App) buildWindow() error {
 					{Title: "提醒标题", Width: 160},
 					{Title: "循环方式", Width: 170},
 					{Title: "时间", Width: 70, Alignment: dcl.AlignCenter},
+					{Title: "关闭方式", Width: 76, Alignment: dcl.AlignCenter},
 					{Title: "下次提醒", Width: 150},
 					{Title: "上次提醒", Width: 150},
 					{Title: "提醒内容"},
@@ -192,7 +202,7 @@ func (a *App) buildWindow() error {
 
 	// 点击窗口的关闭按钮时只隐藏窗口，程序继续驻留托盘。
 	a.mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
-		if !a.quitting {
+		if !a.quitting.Load() {
 			*canceled = true
 			a.mw.SetVisible(false)
 		}
@@ -277,10 +287,11 @@ func (a *App) showManager() {
 
 // quit 退出程序。
 func (a *App) quit() {
-	a.quitting = true
+	a.quitting.Store(true)
 	if a.sched != nil {
 		a.sched.Stop()
 	}
+	a.pending.Clear()
 	a.toasts.CloseAll()
 	if a.ni != nil {
 		a.ni.Dispose()
@@ -293,7 +304,7 @@ func (a *App) refreshLoop() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
-		if a.quitting {
+		if a.quitting.Load() {
 			return
 		}
 		safeSynchronize(a.mw, func() {
@@ -370,7 +381,13 @@ func (a *App) previewSelected() {
 		errorBox(a.mw, "请先在列表中选择一条提醒。")
 		return
 	}
-	a.toasts.Show(item.Title, item.Message, time.Now())
+	// 预览不进入待确认队列，因此这里不带 AlarmID。
+	a.toasts.Show(toastRequest{
+		Title:      item.Title,
+		Message:    item.Message,
+		FiredAt:    time.Now(),
+		RequireAck: item.RequireAck,
+	})
 }
 
 // toggleAlarm 启停闹钟，由列表中的复选框触发。
@@ -393,8 +410,21 @@ func (a *App) toggleAlarm(item *alarm.Alarm, enabled bool) {
 func (a *App) applyChanges() {
 	a.model.setItems(a.alarms)
 	a.sched.SetAlarms(a.alarms)
+	a.prunePending()
 	a.save()
 	a.model.refresh()
+}
+
+// prunePending 清掉已被删除、停用，或关闭了「必须手动关闭」的闹钟留下的待确认提醒。
+func (a *App) prunePending() {
+	alive := make(map[string]bool, len(a.alarms))
+	for _, item := range a.alarms {
+		if item.Enabled && item.RequireAck {
+			alive[item.ID] = true
+		}
+	}
+	a.pending.Retain(alive)
+	a.updateTrayTip()
 }
 
 // save 持久化闹钟列表。
@@ -420,11 +450,86 @@ func (a *App) onSchedulerEvent(ev scheduler.Event) {
 			break
 		}
 		if ev.Fired {
-			a.toasts.Show(ev.Title, ev.Message, ev.At)
+			a.fire(ev)
 		}
 		a.save()
 		a.model.refresh()
 	})
+}
+
+// fire 弹出一条到点的提醒。
+// 开启了「必须手动关闭」的提醒会登记进待确认队列，直到用户点掉为止。
+func (a *App) fire(ev scheduler.Event) {
+	req := toastRequest{
+		AlarmID:    ev.ID,
+		Title:      ev.Title,
+		Message:    ev.Message,
+		FiredAt:    ev.At,
+		Attempt:    1,
+		RequireAck: ev.RequireAck,
+	}
+	if ev.RequireAck {
+		item := a.pending.Fire(ev.ID, ev.Title, ev.Message, ev.At)
+		req.Attempt = item.Attempt
+	} else {
+		// 不需要确认的提醒不进队列，弹窗关闭后就结束了。
+		req.AlarmID = ""
+	}
+	a.toasts.Show(req)
+	a.updateTrayTip()
+}
+
+// onToastClosed 在弹窗关闭时被调用，决定这条提醒是就此结束还是稍后再来。
+func (a *App) onToastClosed(alarmID string, acknowledged bool) {
+	if acknowledged {
+		a.pending.Ack(alarmID)
+	} else {
+		a.pending.Hide(alarmID, time.Now().Add(nagInterval))
+	}
+	a.updateTrayTip()
+}
+
+// nagLoop 定时检查待确认的提醒，到点后重新弹出。
+func (a *App) nagLoop() {
+	ticker := time.NewTicker(nagCheckInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if a.quitting.Load() {
+			return
+		}
+		safeSynchronize(a.mw, a.nagStep)
+	}
+}
+
+// nagStep 在界面线程上重弹所有到点的待确认提醒。
+func (a *App) nagStep() {
+	due := a.pending.TakeDue(time.Now())
+	if len(due) == 0 {
+		return
+	}
+	for _, item := range due {
+		a.toasts.Show(toastRequest{
+			AlarmID:    item.AlarmID,
+			Title:      item.Title,
+			Message:    item.Message,
+			FiredAt:    item.FiredAt,
+			Attempt:    item.Attempt,
+			RequireAck: true,
+		})
+	}
+	a.updateTrayTip()
+}
+
+// updateTrayTip 把待确认的提醒条数反映到托盘图标的悬停提示上。
+func (a *App) updateTrayTip() {
+	if a.ni == nil {
+		return
+	}
+	tip := appName
+	if n := a.pending.Len(); n > 0 {
+		tip = fmt.Sprintf("%s（%d 条提醒待确认）", appName, n)
+	}
+	a.ni.SetToolTip(tip)
 }
 
 // autostartChanged 响应管理窗口中的开机自启复选框。

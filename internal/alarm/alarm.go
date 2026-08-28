@@ -53,6 +53,9 @@ type Alarm struct {
 	Message string `json:"message"`
 	// Enabled 表示该闹钟是否启用。
 	Enabled bool `json:"enabled"`
+	// RequireAck 表示提醒必须由用户手动关闭。
+	// 开启后，弹窗自动隐藏不算处理完毕，会每隔一段时间重新弹出，直到用户点掉为止。
+	RequireAck bool `json:"requireAck,omitempty"`
 	// Repeat 是循环方式。
 	Repeat Repeat `json:"repeat"`
 	// Hour 是触发时刻的小时（0-23），RepeatInterval 时忽略。
@@ -117,17 +120,18 @@ func WeekdayName(wd int) string {
 func New() *Alarm {
 	now := time.Now()
 	return &Alarm{
-		ID:       newID(now),
-		Title:    "新提醒",
-		Enabled:  true,
-		Repeat:   RepeatDaily,
-		Hour:     now.Hour(),
-		Minute:   now.Minute(),
-		Weekdays: []int{int(now.Weekday())},
-		Days:     []int{now.Day()},
-		Month:    int(now.Month()),
-		Date:     now.Format(DateLayout),
-		Interval: 30,
+		ID:         newID(now),
+		Title:      "新提醒",
+		Enabled:    true,
+		Repeat:     RepeatDaily,
+		Hour:       now.Hour(),
+		Minute:     now.Minute(),
+		Weekdays:   []int{int(now.Weekday())},
+		Days:       []int{now.Day()},
+		Month:      int(now.Month()),
+		Date:       now.Format(DateLayout),
+		Interval:   30,
+		RequireAck: true,
 	}
 }
 

@@ -132,6 +132,9 @@ type toastManager struct {
 	items []*toast
 	// stop 用于结束当前的倒计时协程，无弹窗时为 nil。
 	stop chan struct{}
+	// onClosed 在弹窗关闭时调用，acknowledged 表示是否由用户手动关闭。
+	// alarmID 为空表示这是一次预览，调用方应当忽略。
+	onClosed func(alarmID string, acknowledged bool)
 }
 
 // toast 是一个提醒弹窗。整张卡片由一个自绘控件承担，
@@ -141,13 +144,19 @@ type toast struct {
 	form   *walk.MainWindow
 	widget *walk.CustomWidget
 
+	// alarmID 是来源闹钟的标识，预览弹窗为空。
+	alarmID string
 	title   string
 	message string
 	firedAt time.Time
+	// attempt 是这条提醒第几次弹出，从 1 开始。
+	attempt int
 
 	remain int
 	// paused 表示倒计时因鼠标停留而暂停。
 	paused bool
+	// requireAck 表示这条提醒需要用户手动关闭，仅影响卡片上的文案。
+	requireAck bool
 
 	bodyHeight int
 	cardHeight int
@@ -156,19 +165,48 @@ type toast struct {
 	closed     bool
 }
 
-// Show 弹出一个提醒。title 为标题，message 为正文，firedAt 为触发时刻。
-func (m *toastManager) Show(title, message string, firedAt time.Time) {
-	// 超过上限时先收掉最早的一个，避免铺满整个屏幕。
-	for len(m.items) >= toastMaxVisible {
-		m.items[0].close()
+// toastRequest 描述一次要弹出的提醒。
+type toastRequest struct {
+	// AlarmID 是来源闹钟的标识，预览时留空。
+	AlarmID string
+	// Title 是提醒标题。
+	Title string
+	// Message 是提醒正文。
+	Message string
+	// FiredAt 是触发时刻。
+	FiredAt time.Time
+	// Attempt 是第几次弹出，从 1 开始；大于 1 时卡片上会标出次数。
+	Attempt int
+	// RequireAck 表示这条提醒需要用户手动关闭。
+	RequireAck bool
+}
+
+// Show 按请求弹出一个提醒。
+func (m *toastManager) Show(req toastRequest) {
+	// 同一条闹钟只保留最新的一张卡片。鼠标停在卡片上会让它迟迟不消失，
+	// 这期间闹钟可能又到点了，不处理的话屏幕上会出现两张一样的卡片。
+	if req.AlarmID != "" {
+		m.closeByAlarm(req.AlarmID)
 	}
 
+	// 超过上限时先收掉最早的一个，避免铺满整个屏幕。
+	for len(m.items) >= toastMaxVisible {
+		m.items[0].expire()
+	}
+
+	attempt := req.Attempt
+	if attempt < 1 {
+		attempt = 1
+	}
 	t := &toast{
-		mgr:     m,
-		title:   strings.TrimSpace(title),
-		message: strings.TrimSpace(message),
-		firedAt: firedAt,
-		remain:  toastAutoCloseSeconds,
+		mgr:        m,
+		alarmID:    req.AlarmID,
+		title:      strings.TrimSpace(req.Title),
+		message:    strings.TrimSpace(req.Message),
+		firedAt:    req.FiredAt,
+		attempt:    attempt,
+		requireAck: req.RequireAck,
+		remain:     toastAutoCloseSeconds,
 	}
 	if err := t.build(); err != nil {
 		return
@@ -223,9 +261,18 @@ func (m *toastManager) tickAll() {
 // CloseAll 关闭全部弹窗并停止倒计时，退出程序前调用。
 func (m *toastManager) CloseAll() {
 	for len(m.items) > 0 {
-		m.items[0].close()
+		m.items[0].closeWith(false, false)
 	}
 	m.stopTicker()
+}
+
+// closeByAlarm 关掉指定闹钟当前显示的卡片，且不触发关闭回调。
+func (m *toastManager) closeByAlarm(alarmID string) {
+	for _, t := range append([]*toast(nil), m.items...) {
+		if t.alarmID == alarmID {
+			t.closeWith(false, false)
+		}
+	}
 }
 
 // remove 把弹窗移出管理列表。
@@ -316,7 +363,7 @@ func (t *toast) build() error {
 	t.widget.SetCursor(walk.CursorHand())
 	t.widget.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
 		if button == walk.LeftButton {
-			t.close()
+			t.dismiss()
 		}
 	})
 
@@ -449,7 +496,7 @@ func (t *toast) paint(canvas *walk.Canvas, _ walk.Rectangle) error {
 		X: toastContentLeft, Y: footerY,
 		Width: half, Height: toastFooterHeight,
 	}
-	if err := canvas.DrawText(t.firedAt.Format("2006-01-02 15:04"), res.smallFont, colorMuted, timeRect,
+	if err := canvas.DrawText(t.stampText(), res.smallFont, colorMuted, timeRect,
 		walk.TextSingleLine|walk.TextVCenter); err != nil {
 		return err
 	}
@@ -486,8 +533,26 @@ func (t *toast) closeRect() walk.Rectangle {
 	}
 }
 
-// tipText 返回底部右侧的倒计时提示文字。
+// stampText 返回底部左侧的时间文字，重复提醒时附带次数。
+func (t *toast) stampText() string {
+	stamp := t.firedAt.Format("2006-01-02 15:04")
+	if t.attempt > 1 {
+		return fmt.Sprintf("%s · 第 %d 次", stamp, t.attempt)
+	}
+	return stamp
+}
+
+// tipText 返回底部右侧的提示文字。
+//
+// 需要确认的提醒会说明「点击确认」，因为对这类提醒来说，
+// 倒计时结束只是暂时隐藏，过一会儿还会再弹出来。
 func (t *toast) tipText() string {
+	if t.requireAck {
+		if t.paused {
+			return "点击确认 · 已暂停"
+		}
+		return fmt.Sprintf("点击确认 · %ds", t.remain)
+	}
 	if t.paused {
 		return "移开鼠标后继续"
 	}
@@ -517,7 +582,7 @@ func (t *toast) countdownStep() {
 	t.remain, t.paused = remain, paused
 
 	if shouldClose {
-		t.close()
+		t.expire()
 		return
 	}
 	if changed && t.widget != nil {
@@ -538,8 +603,19 @@ func (t *toast) hovered() bool {
 	return pt.X >= rc.Left && pt.X < rc.Right && pt.Y >= rc.Top && pt.Y < rc.Bottom
 }
 
-// close 关闭并销毁弹窗，同时让剩余弹窗重新排列。
-func (t *toast) close() {
+// dismiss 由用户点击卡片触发，表示这条提醒已经被看到并处理。
+func (t *toast) dismiss() {
+	t.closeWith(true, true)
+}
+
+// expire 表示弹窗是倒计时结束后自动隐藏的，并不算用户已经处理。
+func (t *toast) expire() {
+	t.closeWith(false, true)
+}
+
+// closeWith 关闭并销毁弹窗，同时让剩余弹窗重新排列。
+// acknowledged 表示是否由用户手动关闭；notify 为假时不通知管理器（退出程序时用）。
+func (t *toast) closeWith(acknowledged, notify bool) {
 	if t.closed {
 		return
 	}
@@ -547,4 +623,8 @@ func (t *toast) close() {
 	t.mgr.remove(t)
 	t.form.Dispose()
 	t.mgr.arrange()
+
+	if notify && t.mgr.onClosed != nil && t.alarmID != "" {
+		t.mgr.onClosed(t.alarmID, acknowledged)
+	}
 }
