@@ -18,7 +18,7 @@ import (
 const uiFontFamily = "Microsoft YaHei UI"
 
 // appName 是显示在窗口标题与托盘提示中的程序名。
-const appName = "GoClock 闹钟"
+const appName = "GoClock 助手"
 
 var (
 	appIconOnce sync.Once

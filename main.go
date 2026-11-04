@@ -28,7 +28,7 @@ func main() {
 
 	app, err := ui.NewApp()
 	if err != nil {
-		walk.MsgBox(nil, "GoClock 闹钟", err.Error(), walk.MsgBoxIconError|walk.MsgBoxOK)
+		walk.MsgBox(nil, "GoClock 助手", err.Error(), walk.MsgBoxIconError|walk.MsgBoxOK)
 		os.Exit(1)
 	}
 
@@ -36,7 +36,7 @@ func main() {
 	inst.OnActivate(app.Activate)
 
 	if err := app.Run(); err != nil {
-		walk.MsgBox(nil, "GoClock 闹钟", err.Error(), walk.MsgBoxIconError|walk.MsgBoxOK)
+		walk.MsgBox(nil, "GoClock 助手", err.Error(), walk.MsgBoxIconError|walk.MsgBoxOK)
 		os.Exit(1)
 	}
 }

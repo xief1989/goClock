@@ -11,6 +11,7 @@ import (
 
 	"goclock/internal/alarm"
 	"goclock/internal/autostart"
+	"goclock/internal/hotkey"
 	"goclock/internal/scheduler"
 	"goclock/internal/storage"
 )
@@ -36,6 +37,40 @@ type App struct {
 	autoCheck  *walk.CheckBox
 	autoAction *walk.Action
 
+	// settingsStore 与 settings 是程序级设置（截图热键、保存目录等），与闹钟数据分开存放。
+	settingsStore *storage.SettingsStore
+	settings      storage.Settings
+	// settingsErr 是启动时读取设置失败的原因，托盘建好后提示一次。
+	settingsErr string
+
+	// hotkeys 管理全局热键，shotHotkeyID 为 0 表示截图热键当前没有生效，hotkeyErr 是没生效的原因。
+	hotkeys      *hotkey.Manager
+	shotHotkeyID int32
+	hotkeyErr    string
+
+	// 截图相关的窗口：同一时间最多一个遮罩、一个长截图会话或一个录屏，钉图、长图预览与识别窗口可以有多个。
+	overlay     *shotOverlay
+	long        *longShot
+	recording   *recordSession
+	pins        map[*pinWindow]struct{}
+	viewers     map[*longViewer]struct{}
+	textWindows map[*textWindow]struct{}
+	// balloonTarget 是最近一条托盘提示对应的文件，点击提示时在资源管理器里选中它。
+	balloonTarget string
+
+	shotAction       *walk.Action
+	stopRecordAction *walk.Action
+	hotkeyEdit       *walk.LineEdit
+	hotkeyStatus     *walk.Label
+	saveDirEdit      *walk.LineEdit
+	autoSaveCheck    *walk.CheckBox
+	fpsCombo         *walk.ComboBox
+	cursorCheck      *walk.CheckBox
+	targetCombo      *walk.ComboBox
+	apiKeyEdit       *walk.LineEdit
+	apiKeyStatus     *walk.Label
+	proxyEdit        *walk.LineEdit
+
 	// quitting 用于区分「用户关闭窗口」与「真正退出程序」。
 	// 后台协程会读它，所以用原子变量。
 	quitting atomic.Bool
@@ -53,12 +88,27 @@ func NewApp() (*App, error) {
 		return nil, err
 	}
 
+	settingsStore, err := storage.NewSettingsStore()
+	if err != nil {
+		return nil, err
+	}
+	// 设置文件坏了不影响闹钟，按默认设置启动，托盘建好后再提示。
+	settings, settingsErr := settingsStore.Load()
+
 	a := &App{
-		store:    store,
-		alarms:   list,
-		toasts:   &toastManager{},
-		pending:  newReminderQueue(),
-		firstRun: firstRun,
+		store:         store,
+		alarms:        list,
+		toasts:        &toastManager{},
+		pending:       newReminderQueue(),
+		firstRun:      firstRun,
+		settingsStore: settingsStore,
+		settings:      settings,
+		pins:          map[*pinWindow]struct{}{},
+		viewers:       map[*longViewer]struct{}{},
+		textWindows:   map[*textWindow]struct{}{},
+	}
+	if settingsErr != nil {
+		a.settingsErr = settingsErr.Error()
 	}
 	a.toasts.onClosed = a.onToastClosed
 	a.model = &alarmModel{
@@ -77,6 +127,10 @@ func (a *App) Run() error {
 	if err := a.buildTray(); err != nil {
 		return err
 	}
+	if a.settingsErr != "" {
+		a.ni.ShowWarning("设置文件读取失败", a.settingsErr+"。已按默认设置启动。")
+	}
+	a.initHotkeys()
 
 	a.sched = scheduler.New(a.onSchedulerEvent)
 	a.sched.SetAlarms(a.alarms)
@@ -118,77 +172,88 @@ func (a *App) buildWindow() error {
 		Title:    appName,
 		Icon:     iconProperty(),
 		Font:     dcl.Font{Family: uiFontFamily, PointSize: 9},
-		MinSize:  dcl.Size{Width: 720, Height: 380},
-		Size:     dcl.Size{Width: 900, Height: 480},
+		MinSize:  dcl.Size{Width: 720, Height: 420},
+		Size:     dcl.Size{Width: 900, Height: 580},
 		Layout:   dcl.VBox{Margins: dcl.Margins{Left: 10, Top: 10, Right: 10, Bottom: 8}, Spacing: 8},
 		Children: []dcl.Widget{
-			dcl.Composite{
-				Layout: dcl.HBox{MarginsZero: true, Spacing: 6},
-				Children: []dcl.Widget{
-					dcl.PushButton{
-						AssignTo:  &btnAdd,
-						Text:      "新增",
-						MinSize:   dcl.Size{Width: 78},
-						OnClicked: a.addAlarm,
+			dcl.TabWidget{
+				Pages: []dcl.TabPage{
+					{
+						Title:  "闹钟",
+						Layout: dcl.VBox{Margins: dcl.Margins{Left: 8, Top: 8, Right: 8, Bottom: 6}, Spacing: 8},
+						Children: []dcl.Widget{
+							dcl.Composite{
+								Layout: dcl.HBox{MarginsZero: true, Spacing: 6},
+								Children: []dcl.Widget{
+									dcl.PushButton{
+										AssignTo:  &btnAdd,
+										Text:      "新增",
+										MinSize:   dcl.Size{Width: 78},
+										OnClicked: a.addAlarm,
+									},
+									dcl.PushButton{
+										AssignTo:  &btnEdit,
+										Text:      "编辑",
+										MinSize:   dcl.Size{Width: 78},
+										OnClicked: a.editSelected,
+									},
+									dcl.PushButton{
+										AssignTo:  &btnDelete,
+										Text:      "删除",
+										MinSize:   dcl.Size{Width: 78},
+										OnClicked: a.deleteSelected,
+									},
+									dcl.PushButton{
+										AssignTo:  &btnTest,
+										Text:      "预览弹窗",
+										MinSize:   dcl.Size{Width: 88},
+										OnClicked: a.previewSelected,
+									},
+									dcl.HSpacer{},
+									dcl.CheckBox{
+										AssignTo:         &a.autoCheck,
+										Text:             "开机自动启动",
+										Checked:          autostart.Enabled(),
+										OnCheckedChanged: a.autostartChanged,
+									},
+								},
+							},
+							dcl.TableView{
+								AssignTo:            &a.tv,
+								Model:               a.model,
+								CheckBoxes:          true,
+								AlternatingRowBG:    true,
+								MultiSelection:      false,
+								LastColumnStretched: true,
+								OnItemActivated:     a.editSelected,
+								Columns: []dcl.TableViewColumn{
+									{Title: "提醒标题", Width: 160},
+									{Title: "循环方式", Width: 170},
+									{Title: "时间", Width: 70, Alignment: dcl.AlignCenter},
+									{Title: "关闭方式", Width: 76, Alignment: dcl.AlignCenter},
+									{Title: "下次提醒", Width: 150},
+									{Title: "上次提醒", Width: 150},
+									{Title: "提醒内容"},
+								},
+							},
+							dcl.Composite{
+								Layout: dcl.HBox{MarginsZero: true, Spacing: 8},
+								Children: []dcl.Widget{
+									dcl.Label{
+										Text:      "勾选左侧方框可快速启停；关闭本窗口后程序继续在托盘运行。",
+										TextColor: colorMuted,
+									},
+									dcl.HSpacer{},
+									dcl.PushButton{
+										Text:      "隐藏到托盘",
+										MinSize:   dcl.Size{Width: 96},
+										OnClicked: func() { a.mw.SetVisible(false) },
+									},
+								},
+							},
+						},
 					},
-					dcl.PushButton{
-						AssignTo:  &btnEdit,
-						Text:      "编辑",
-						MinSize:   dcl.Size{Width: 78},
-						OnClicked: a.editSelected,
-					},
-					dcl.PushButton{
-						AssignTo:  &btnDelete,
-						Text:      "删除",
-						MinSize:   dcl.Size{Width: 78},
-						OnClicked: a.deleteSelected,
-					},
-					dcl.PushButton{
-						AssignTo:  &btnTest,
-						Text:      "预览弹窗",
-						MinSize:   dcl.Size{Width: 88},
-						OnClicked: a.previewSelected,
-					},
-					dcl.HSpacer{},
-					dcl.CheckBox{
-						AssignTo:         &a.autoCheck,
-						Text:             "开机自动启动",
-						Checked:          autostart.Enabled(),
-						OnCheckedChanged: a.autostartChanged,
-					},
-				},
-			},
-			dcl.TableView{
-				AssignTo:            &a.tv,
-				Model:               a.model,
-				CheckBoxes:          true,
-				AlternatingRowBG:    true,
-				MultiSelection:      false,
-				LastColumnStretched: true,
-				OnItemActivated:     a.editSelected,
-				Columns: []dcl.TableViewColumn{
-					{Title: "提醒标题", Width: 160},
-					{Title: "循环方式", Width: 170},
-					{Title: "时间", Width: 70, Alignment: dcl.AlignCenter},
-					{Title: "关闭方式", Width: 76, Alignment: dcl.AlignCenter},
-					{Title: "下次提醒", Width: 150},
-					{Title: "上次提醒", Width: 150},
-					{Title: "提醒内容"},
-				},
-			},
-			dcl.Composite{
-				Layout: dcl.HBox{MarginsZero: true, Spacing: 8},
-				Children: []dcl.Widget{
-					dcl.Label{
-						Text:      "勾选左侧方框可快速启停；关闭本窗口后程序继续在托盘运行。",
-						TextColor: colorMuted,
-					},
-					dcl.HSpacer{},
-					dcl.PushButton{
-						Text:      "隐藏到托盘",
-						MinSize:   dcl.Size{Width: 96},
-						OnClicked: func() { a.mw.SetVisible(false) },
-					},
+					a.shotSettingsPage(),
 				},
 			},
 		},
@@ -245,6 +310,31 @@ func (a *App) buildTray() error {
 		return err
 	}
 
+	// 菜单文字里的热键由 refreshHotkeyUI 补上。
+	a.shotAction = walk.NewAction()
+	a.shotAction.SetText("截图")
+	a.shotAction.Triggered().Attach(a.startShotFromMenu)
+	if err := ni.ContextMenu().Actions().Add(a.shotAction); err != nil {
+		return err
+	}
+
+	translateAction := walk.NewAction()
+	translateAction.SetText("文本翻译")
+	translateAction.Triggered().Attach(a.openTranslateFromTray)
+	if err := ni.ContextMenu().Actions().Add(translateAction); err != nil {
+		return err
+	}
+
+	// 只在录屏期间显示。
+	a.stopRecordAction = walk.NewAction()
+	a.stopRecordAction.SetText("停止录屏并保存")
+	a.stopRecordAction.SetVisible(false)
+	a.stopRecordAction.Triggered().Attach(a.stopRecording)
+	if err := ni.ContextMenu().Actions().Add(a.stopRecordAction); err != nil {
+		return err
+	}
+	ni.MessageClicked().Attach(a.onBalloonClicked)
+
 	if err := ni.ContextMenu().Actions().Add(walk.NewSeparatorAction()); err != nil {
 		return err
 	}
@@ -293,6 +383,10 @@ func (a *App) quit() {
 	}
 	a.pending.Clear()
 	a.toasts.CloseAll()
+	a.closeShots()
+	if a.hotkeys != nil {
+		a.hotkeys.Close()
+	}
 	if a.ni != nil {
 		a.ni.Dispose()
 	}
