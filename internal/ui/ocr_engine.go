@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -14,8 +15,9 @@ import (
 )
 
 const (
-	// paddleIdleRelease 是高精度识别引擎闲置多久后释放：加载后常驻几百 MB 内存，用完不该一直占着。
-	paddleIdleRelease = 5 * time.Minute
+	// paddleIdleRelease 是高精度识别引擎闲置多久后释放：加载后常驻上百 MB 内存，识别结果已经留在窗口里，
+	// 引擎不必久留；释放后再识别要重新加载，不到半秒。
+	paddleIdleRelease = time.Minute
 	// paddleRetryAfter 是自动下载失败后多久内不再重试，期间直接用系统 OCR，免得每次识别都等网络超时。
 	paddleRetryAfter = 10 * time.Minute
 	// progressInterval 是进度提示的最短刷新间隔，下载与长图识别的回调很密，不必每次都刷界面。
@@ -59,6 +61,8 @@ type ocrEngines struct {
 // 高精度识别不可用（下载失败、加载失败、识别出错）时自动改用系统 OCR，原因放在 fallback 里。
 // 只有 ctx 被取消或系统 OCR 也失败时才返回错误。
 func (e *ocrEngines) recognize(ctx context.Context, img *image.RGBA, engine, proxy string, report func(string)) (ocrOutcome, error) {
+	// 识别用的大块临时数据（缩放后的图、模型输入）当场还给系统；否则 Go 会留着它们，程序空闲时也多占几十 MB。
+	defer debug.FreeOSMemory()
 	if engine == storage.OCREngineWindows {
 		return windowsOCR(img, "", report)
 	}
@@ -202,13 +206,17 @@ func (e *ocrEngines) releaseLater() {
 	}
 }
 
-// releaseIdle 在闲置到期时释放引擎；计时期间又被占用的话什么也不做。
+// releaseIdle 在闲置到期时释放引擎，并把空出来的内存还给系统；计时期间又被占用的话什么也不做。
 func (e *ocrEngines) releaseIdle() {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.busy == 0 && e.paddle != nil {
+	released := e.busy == 0 && e.paddle != nil
+	if released {
 		e.paddle.Close()
 		e.paddle = nil
+	}
+	e.mu.Unlock()
+	if released {
+		debug.FreeOSMemory()
 	}
 }
 

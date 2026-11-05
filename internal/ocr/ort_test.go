@@ -25,7 +25,7 @@ func TestORTLoadsModels(t *testing.T) {
 		if name == "" {
 			continue
 		}
-		s, err := rt.openSession(filepath.Join(dir, name), 0)
+		s, err := rt.openSession(filepath.Join(dir, name), 0, false)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"unicode"
 )
 
 // PaddleOCR（PP-OCRv5 移动版）识别：先用检测模型找出文字行，再逐行用识别模型读出文字。
@@ -77,11 +78,13 @@ func OpenPaddle(dir string) (*Paddle, error) {
 		return nil, err
 	}
 	p := &Paddle{rt: rt}
-	if p.det, err = rt.openSession(filepath.Join(dir, detModelFile), 0); err != nil {
+	// 检测模型整张图一次推理，全屏截图的中间结果有几百 MB；内存池会把这块一直留着直到引擎释放，所以关掉。
+	// 识别模型逐行推理、每次的量很小，留着内存池免得每行都重新分配（实测关掉要慢三到五成）。
+	if p.det, err = rt.openSession(filepath.Join(dir, detModelFile), 0, true); err != nil {
 		p.Close()
 		return nil, err
 	}
-	if p.rec, err = rt.openSession(filepath.Join(dir, recModelFile), 0); err != nil {
+	if p.rec, err = rt.openSession(filepath.Join(dir, recModelFile), 0, false); err != nil {
 		p.Close()
 		return nil, err
 	}
@@ -145,17 +148,17 @@ func (p *Paddle) RecognizeProgress(img *image.RGBA, progress func(done, total in
 	if err != nil {
 		return nil, err
 	}
-	texts, scores, err := p.recognizeBoxes(img, boxes, progress)
+	texts, scores, glyphs, err := p.recognizeBoxes(img, boxes, progress)
 	if err != nil {
 		return nil, err
 	}
 	var lines []Line
 	for i, b := range boxes {
-		text := strings.TrimSpace(texts[i])
+		text, g := trimGlyphs(texts[i], glyphs[i])
 		if text == "" || scores[i] < recMinScore {
 			continue
 		}
-		lines = append(lines, Line{Text: text, Rect: b})
+		lines = append(lines, Line{Text: text, Rect: b, Glyphs: g})
 	}
 	lines = mergeRows(lines)
 	joined := make([]string, len(lines))
@@ -286,18 +289,21 @@ func dbBoxes(prob []float32, w, h int) []image.Rectangle {
 type recPiece struct {
 	owner int
 	img   *image.RGBA
+	// x0 是这一段在缩放后整行里的起始横坐标，scale 是整行的缩放比例，用来把字的位置换回原图。
+	x0    int
+	scale float64
 }
 
-// recognizeBoxes 识别全部文字框，返回每个框的文字与平均置信度。
+// recognizeBoxes 识别全部文字框，返回每个框的文字、平均置信度与逐字位置（原图坐标）。
 // 各段按宽度排序后成批推理，同一批补齐到最宽的那段，补出来的部分不参与解码。
-func (p *Paddle) recognizeBoxes(img *image.RGBA, boxes []image.Rectangle, progress func(done, total int)) ([]string, []float64, error) {
+func (p *Paddle) recognizeBoxes(img *image.RGBA, boxes []image.Rectangle, progress func(done, total int)) ([]string, []float64, [][]image.Rectangle, error) {
 	var pieces []recPiece
 	for i, box := range boxes {
 		scale := float64(recHeight) / float64(box.Dy())
 		line := resize(subImage(img, box), scale)
 		// 按识别宽度上限等宽切段，切出来的段按顺序拼回去。
 		for x := 0; x < line.Rect.Dx(); x += recMaxWidth {
-			pieces = append(pieces, recPiece{owner: i,
+			pieces = append(pieces, recPiece{owner: i, x0: x, scale: scale,
 				img: subImage(line, image.Rect(x, 0, min(x+recMaxWidth, line.Rect.Dx()), line.Rect.Dy()))})
 		}
 	}
@@ -309,10 +315,11 @@ func (p *Paddle) recognizeBoxes(img *image.RGBA, boxes []image.Rectangle, progre
 
 	texts := make([]string, len(pieces))
 	scores := make([]float64, len(pieces))
+	steps := make([][]float64, len(pieces))
 	for start := 0; start < len(order); start += recBatch {
 		batch := order[start:min(start+recBatch, len(order))]
-		if err := p.recognizeBatch(pieces, batch, texts, scores); err != nil {
-			return nil, nil, err
+		if err := p.recognizeBatch(pieces, batch, texts, scores, steps); err != nil {
+			return nil, nil, nil, err
 		}
 		if progress != nil {
 			progress(start+len(batch), len(order))
@@ -321,22 +328,139 @@ func (p *Paddle) recognizeBoxes(img *image.RGBA, boxes []image.Rectangle, progre
 
 	outText := make([]string, len(boxes))
 	outScore := make([]float64, len(boxes))
+	centers := make([][]float64, len(boxes))
 	counts := make([]int, len(boxes))
 	for i, pc := range pieces {
 		outText[pc.owner] += texts[i]
 		outScore[pc.owner] += scores[i]
 		counts[pc.owner]++
+		// 第 t 个时间步对应缩放后输入里 [t·stride, (t+1)·stride) 这一列，取中点换回原图横坐标。
+		for _, t := range steps[i] {
+			x := float64(pc.x0) + (t+0.5)*recStride
+			centers[pc.owner] = append(centers[pc.owner], float64(boxes[pc.owner].Min.X)+x/pc.scale)
+		}
 	}
+	glyphs := make([][]image.Rectangle, len(boxes))
 	for i := range outScore {
 		if counts[i] > 0 {
 			outScore[i] /= float64(counts[i])
 		}
+		glyphs[i] = glyphRects(boxes[i], centers[i])
+		snapGlyphs(img, boxes[i], glyphs[i])
 	}
-	return outText, outScore, nil
+	return outText, outScore, glyphs, nil
 }
 
-// recognizeBatch 把一批行图片补齐到同一宽度后一次推理，结果写回 texts、scores 的对应位置。
-func (p *Paddle) recognizeBatch(pieces []recPiece, batch []int, texts []string, scores []float64) error {
+// glyphSnapInk 是判断「有笔画」的亮度差：与背景亮度相差超过它的像素算笔画。
+const glyphSnapInk = 60
+
+// snapGlyphs 把逐字框的边界挪到附近没有笔画的空白列上，首字左边、末字右边挪到笔画的起止处。
+//
+// CTC 给的位置在一行开头的几个字常偏左小半个字（实测西文首字母偏 3～4 像素），西文字母窄，点在字的左半边
+// 也会被当成右半边。背景取文字框上下边缘的亮度，深底浅字、浅底深字都适用；找不到空白列（字挨着字）就不动。
+func snapGlyphs(img *image.RGBA, box image.Rectangle, glyphs []image.Rectangle) {
+	n := len(glyphs)
+	if n == 0 || box.Dx() < 2 || box.Dy() < 3 {
+		return
+	}
+	luma := func(x, y int) int {
+		c := img.RGBAAt(x, y)
+		return (int(c.R)*299 + int(c.G)*587 + int(c.B)*114) / 1000
+	}
+	var edge []int
+	for x := box.Min.X; x < box.Max.X; x++ {
+		edge = append(edge, luma(x, box.Min.Y), luma(x, box.Max.Y-1))
+	}
+	sortInts(edge, func(a, b int) bool { return a < b })
+	bg := edge[len(edge)/2]
+	ink := func(x int) bool {
+		for y := box.Min.Y; y < box.Max.Y; y++ {
+			if d := luma(x, y) - bg; d > glyphSnapInk || d < -glyphSnapInk {
+				return true
+			}
+		}
+		return false
+	}
+
+	// 字与字的分界：在原分界左右各约三分之一个字宽内找最近的空白列。
+	for i := 0; i+1 < n; i++ {
+		b := glyphs[i].Max.X
+		reach := max(2, min(glyphs[i].Dx(), glyphs[i+1].Dx())/3)
+		for d := 0; d <= reach; d++ {
+			if x := b + d; x < glyphs[i+1].Max.X && !ink(x) {
+				b = x
+				break
+			}
+			if x := b - d; x > glyphs[i].Min.X && !ink(x) {
+				b = x
+				break
+			}
+		}
+		glyphs[i].Max.X, glyphs[i+1].Min.X = b, b
+	}
+	// 首字的左边、末字的右边贴着笔画。
+	for x := box.Min.X; x < glyphs[0].Max.X; x++ {
+		if ink(x) {
+			glyphs[0].Min.X = x
+			break
+		}
+	}
+	for x := box.Max.X - 1; x >= glyphs[n-1].Min.X; x-- {
+		if ink(x) {
+			glyphs[n-1].Max.X = x + 1
+			break
+		}
+	}
+}
+
+// glyphRects 由每个字中心的横坐标推出逐字的框：相邻两字以中点为界，首尾两字按与邻字的间距向外推，
+// 纵向取文字框的上下沿，都不超出文字框。只有一个字时就是整个文字框。
+func glyphRects(box image.Rectangle, centers []float64) []image.Rectangle {
+	n := len(centers)
+	out := make([]image.Rectangle, n)
+	// edge(i) 是第 i 个字的右边界（也是第 i+1 个字的左边界），edge(-1) 是第一个字的左边界。
+	edge := func(i int) float64 {
+		switch {
+		case n == 1 && i < 0:
+			return float64(box.Min.X)
+		case n == 1:
+			return float64(box.Max.X)
+		case i < 0:
+			return centers[0] - (centers[1]-centers[0])/2
+		case i == n-1:
+			return centers[n-1] + (centers[n-1]-centers[n-2])/2
+		default:
+			return (centers[i] + centers[i+1]) / 2
+		}
+	}
+	clamp := func(v float64) int {
+		return min(max(int(math.Round(v)), box.Min.X), box.Max.X)
+	}
+	for i := range out {
+		x0, x1 := clamp(edge(i-1)), clamp(edge(i))
+		out[i] = image.Rectangle{Min: image.Pt(x0, box.Min.Y), Max: image.Pt(max(x0, x1), box.Max.Y)}
+	}
+	return out
+}
+
+// trimGlyphs 去掉文字首尾的空白，逐字位置同步裁掉，保持一一对应。
+func trimGlyphs(text string, glyphs []image.Rectangle) (string, []image.Rectangle) {
+	runes := []rune(text)
+	if len(glyphs) != len(runes) {
+		return strings.TrimSpace(text), nil
+	}
+	a, b := 0, len(runes)
+	for a < b && unicode.IsSpace(runes[a]) {
+		a++
+	}
+	for b > a && unicode.IsSpace(runes[b-1]) {
+		b--
+	}
+	return string(runes[a:b]), glyphs[a:b]
+}
+
+// recognizeBatch 把一批行图片补齐到同一宽度后一次推理，结果写回 texts、scores、steps 的对应位置。
+func (p *Paddle) recognizeBatch(pieces []recPiece, batch []int, texts []string, scores []float64, steps [][]float64) error {
 	maxW := 16
 	for _, i := range batch {
 		maxW = max(maxW, pieces[i].img.Rect.Dx())
@@ -365,25 +489,29 @@ func (p *Paddle) recognizeBatch(pieces []recPiece, batch []int, texts []string, 
 	if len(out.shape) != 3 || int(out.shape[0]) != n {
 		return fmt.Errorf("识别模型输出形状不对：%v", out.shape)
 	}
-	steps, classes := int(out.shape[1]), int(out.shape[2])
+	nSteps, classes := int(out.shape[1]), int(out.shape[2])
 	for bi, i := range batch {
 		// 只解码这一段实际宽度对应的时间步，补齐出来的灰色区域不算。
-		used := min(steps, (pieces[i].img.Rect.Dx()+recStride-1)/recStride+1)
-		row := out.data[bi*steps*classes : (bi*steps+used)*classes]
-		texts[i], scores[i] = ctcDecode(row, used, classes, p.chars)
+		used := min(nSteps, (pieces[i].img.Rect.Dx()+recStride-1)/recStride+1)
+		row := out.data[bi*nSteps*classes : (bi*nSteps+used)*classes]
+		texts[i], scores[i], steps[i] = ctcDecode(row, used, classes, p.chars)
 	}
 	return nil
 }
 
 // ctcDecode 对识别模型的输出做 CTC 贪心解码：每个时间步取概率最大的字符，
-// 去掉空白符（下标 0）与连续重复，返回文字与所保留字符的平均概率。
+// 去掉空白符（下标 0）与连续重复，返回文字、所保留字符的平均概率，以及每个字所在的时间步
+// （与 []rune(文字) 一一对应；一个字连续占几步时取中间，补的空格取两字之间）。
 // 字典之外多出的最后一类是空格（官方 use_space_char）；
 // 模型漏掉的词间空格按字符间的空白时间步数补上，见 spaceGapSteps。
-func ctcDecode(probs []float32, steps, classes int, chars []string) (string, float64) {
+func ctcDecode(probs []float32, steps, classes int, chars []string) (string, float64, []float64) {
 	var out []rune
+	var at []float64
 	var sum float64
 	kept := 0
 	prev, lastActive := -1, -1
+	// runFrom、runStart 是当前这个字在 out 里的起始下标与它开始的时间步，字跨多步时据此取中间。
+	runFrom, runStart := 0, 0
 	for t := 0; t < steps; t++ {
 		row := probs[t*classes : (t+1)*classes]
 		best, bestP := 0, row[0]
@@ -392,7 +520,8 @@ func ctcDecode(probs []float32, steps, classes int, chars []string) (string, flo
 				best, bestP = c, row[c]
 			}
 		}
-		if best != 0 && best != prev {
+		switch {
+		case best != 0 && best != prev:
 			ch := " "
 			if best < len(chars) {
 				ch = chars[best]
@@ -400,10 +529,19 @@ func ctcDecode(probs []float32, steps, classes int, chars []string) (string, flo
 			r := []rune(ch)
 			if len(out) > 0 && len(r) > 0 && t-lastActive-1 >= spaceGapSteps && needSpace(out[len(out)-1], r[0]) {
 				out = append(out, ' ')
+				at = append(at, float64(lastActive+t)/2)
 			}
+			runFrom, runStart = len(out), t
 			out = append(out, r...)
+			for range r {
+				at = append(at, float64(t))
+			}
 			sum += float64(bestP)
 			kept++
+		case best != 0:
+			for k := runFrom; k < len(at); k++ {
+				at[k] = float64(runStart+t) / 2
+			}
 		}
 		if best != 0 {
 			lastActive = t
@@ -411,9 +549,9 @@ func ctcDecode(probs []float32, steps, classes int, chars []string) (string, flo
 		prev = best
 	}
 	if kept == 0 {
-		return "", 0
+		return "", 0, nil
 	}
-	return string(out), sum / float64(kept)
+	return string(out), sum / float64(kept), at
 }
 
 // needSpace 判断间隔较大的两个相邻字符之间是否该补空格：至少一边是西文，两边都不是标点或空格。

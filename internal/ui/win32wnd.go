@@ -76,6 +76,7 @@ const (
 	dtEndEllipsis         = 0x8000
 	iconSmall             = 0
 	iconBig               = 1
+	vkA                   = 'A'
 	vkC                   = 'C'
 	vkS                   = 'S'
 	vkV                   = 'V'

@@ -27,6 +27,7 @@ const (
 	ortRun                              = 9
 	ortCreateSessionOptions             = 10
 	ortDisableMemPattern                = 17
+	ortDisableCpuMemArena               = 19
 	ortSetSessionGraphOptimizationLevel = 23
 	ortSetIntraOpNumThreads             = 24
 	ortSessionGetInputCount             = 30
@@ -174,8 +175,9 @@ type ortSession struct {
 	outputs []string
 }
 
-// openSession 加载模型文件。threads 是单次推理内部使用的线程数，0 表示由运行库按物理核数决定。
-func (r *ortRuntime) openSession(modelPath string, threads int) (*ortSession, error) {
+// openSession 加载模型文件。threads 是单次推理内部使用的线程数，0 表示由运行库按物理核数决定；
+// noArena 为 true 时关掉 CPU 内存池，每次推理用完的内存当场还给系统。
+func (r *ortRuntime) openSession(modelPath string, threads int, noArena bool) (*ortSession, error) {
 	var opts *ortHandle
 	if err := r.call(ortCreateSessionOptions, uintptr(unsafe.Pointer(&opts))); err != nil {
 		return nil, err
@@ -190,6 +192,11 @@ func (r *ortRuntime) openSession(modelPath string, threads int) (*ortSession, er
 	// 每张图、每行文字的尺寸都不一样，内存模式优化按形状规划内存，形状一变就得重来，反而拖慢，官方建议此时关掉。
 	if err := r.call(ortDisableMemPattern, uintptr(unsafe.Pointer(opts))); err != nil {
 		return nil, err
+	}
+	if noArena {
+		if err := r.call(ortDisableCpuMemArena, uintptr(unsafe.Pointer(opts))); err != nil {
+			return nil, err
+		}
 	}
 
 	wpath, err := syscall.UTF16PtrFromString(modelPath)

@@ -34,7 +34,7 @@ A small helper that lives in the Windows tray. It currently does two things:
 - **Output** — double-click or `Enter` copies to the clipboard (a PNG flavour is included, so Office and browsers paste it losslessly); `Ctrl+S` saves to a file; optionally save automatically every time.
 - **Pin to desktop** — keeps a screenshot floating on top: drag to move, scroll to zoom, double-click to close, right-click to copy or save.
 - **Scrolling capture** — scroll inside the region and the frames are stitched as you go, or let the program scroll for you. Sticky headers, fixed input bars, fixed sidebars and scrollbars are all handled.
-- **Text recognition** — reads the text in a selection (or a pinned image, or a long screenshot) offline, using PaddleOCR (PP-OCRv5) by default or Windows' built-in OCR; the result is editable and copyable.
+- **Text recognition** — reads the text in a selection (or a pinned image, or a long screenshot) offline, using PaddleOCR (PP-OCRv5) by default or Windows' built-in OCR; like WeChat, you **select text directly on the image** to copy or translate it.
 - **Translation** — recognised text, or anything you paste, goes to Google Translate. By default Chinese becomes English and everything else becomes Chinese.
 - **Screen recording** — records the selection to MP4 (H.264, no audio), with pause; frame rate and whether to draw the pointer are configurable.
 
@@ -66,7 +66,7 @@ Run `GoClock.exe`. The first launch opens the management window and writes one s
 | Start over | Drag outside the selection (before annotating), or right-click to drop the selection |
 | Annotate | Pick a tool on the toolbar and drag inside the selection; the row below sets size and colour |
 | Redact | Pick the mosaic tool; the row below chooses brush / rectangle and mosaic / blur |
-| Recognise / translate text | The 文 and 译 buttons on the toolbar; the result opens in a window where it can be edited, copied, or translated into another language |
+| Recognise / translate text | 文 opens the text picker: drag across the image to select text (double-click selects a segment, Shift+click extends, Ctrl+A selects all), then copy or translate the selection; 全文 ("full text") opens all the text for editing. 译 translates all the text straight away |
 | Record the screen | The red camera button on the toolbar starts recording the selection |
 | Type text | With the text tool, click inside the selection; `Enter` for a new line, `Ctrl+Enter` or click elsewhere to finish, `Esc` to discard |
 | Copy to clipboard | Double-click the selection, `Enter`, `Ctrl+C`, or the ✓ button |
@@ -91,8 +91,9 @@ Notes:
 ### Text recognition and translation
 
 - Recognition runs locally, so **the image never leaves the machine**. There are two engines, chosen under "Recognition engine" on the screenshot settings tab:
-  - **High accuracy (default)** — the PaddleOCR PP-OCRv5 mobile models, run through ONNX Runtime. On a chat screenshot it measured a 1.2% character error rate (Windows OCR: 14%), and it keeps the spaces between words in mixed Chinese/English text. On first use it downloads about 33 MB (the ONNX Runtime library plus the detection and recognition models) to `%LOCALAPPDATA%\GoClock\ocr\`. Versions are pinned and every file is checked against a SHA256: the library comes from Microsoft's onnxruntime package on PyPI (with the Tencent Cloud mirror as a fallback), the models from the RapidOCR repository on ModelScope. The download honours the proxy setting. Once loaded the engine stays in memory and is released after 5 idle minutes.
+  - **High accuracy (default)** — the PaddleOCR PP-OCRv5 mobile models, run through ONNX Runtime. On a chat screenshot it measured a 1.2% character error rate (Windows OCR: 14%), and it keeps the spaces between words in mixed Chinese/English text. On first use it downloads about 33 MB (the ONNX Runtime library plus the detection and recognition models) to `%LOCALAPPDATA%\GoClock\ocr\`. Versions are pinned and every file is checked against a SHA256: the library comes from Microsoft's onnxruntime package on PyPI (with the Tencent Cloud mirror as a fallback), the models from the RapidOCR repository on ModelScope. The download honours the proxy setting. Once loaded the engine stays in memory and is released after 1 idle minute.
   - **Built-in** — Windows OCR: nothing to download and fast, but less accurate. The recogniser follows the system language (the Simplified Chinese recogniser also reads Latin letters and digits). For better English-only results, install the English OCR pack as administrator: `Add-WindowsCapability -Online -Name "Language.OCR~~~en-US~0.0.1.0"`
+- 文 opens the **text picker**: the screenshot is shown as-is, with recognised text tinted light blue. Drag to select text, double-click to select a segment, Shift+click to extend, Ctrl+A to select all; Ctrl+C or 复制 ("copy") copies the selection (everything if nothing is selected), 翻译 ("translate") sends the selection to the translation window, 全文 ("full text") opens all the text for editing. In multi-column layouts (such as a three-pane mail client), dragging down one column selects only that column; on long images, dragging past the window edge scrolls automatically.
 - If the high-accuracy engine can't be downloaded or loaded, recognition falls back to Windows OCR and the result window says why. After a failed download there are no retries for 10 minutes, so each recognition doesn't sit waiting for the network.
 - Long images are recognised in tiles. The high-accuracy engine goes line by line with progress in the status bar; a full-page long screenshot of about 300 lines takes a dozen seconds or so. Windows OCR upscales by 1.5× first and takes a few seconds.
 - Known weak spots of Windows OCR: one- or two-character lines and coloured bold headings are sometimes missed — fix them in the result box.
@@ -181,7 +182,7 @@ internal/
     save.go                PNG saving and file naming
     cursor.go              draws the mouse pointer into recorded frames
   ocr/                     text recognition (unit-tested)
-    paddle.go              PaddleOCR: text detection, line recognition, CTC decoding and word spacing
+    paddle.go              PaddleOCR: text detection, line recognition, CTC decoding (with per-character positions) and word spacing
     ort.go                 minimal binding for the ONNX Runtime C API
     assets.go              downloading the high-accuracy files, source fallback and SHA256 checks
     winrt.go / ocr.go      minimal WinRT binding for Windows OCR and result clean-up
@@ -203,7 +204,9 @@ internal/
     shot_long.go           scrolling-capture session: frame, preview panel, manual / auto scroll
     shot_viewer.go         long-image preview window
     shot_pin.go            pinned image window
-    shot_text.go           text recognition / translation result window
+    shot_picker.go         text picker: select text on the image, copy, translate
+    shot_picker_select.go  text selection logic: segments, hit testing, column-aware selection (unit-tested)
+    shot_text.go           text and translation window (full text, translation)
     ocr_engine.go          on-demand download, caching, idle release and Windows OCR fallback for the high-accuracy engine
     shot_record.go         recording session: red frame and control bar
     win32wnd.go            helpers for native Win32 windows and GDI

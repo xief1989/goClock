@@ -55,6 +55,7 @@ type App struct {
 	pins        map[*pinWindow]struct{}
 	viewers     map[*longViewer]struct{}
 	textWindows map[*textWindow]struct{}
+	pickers     map[*pickerWindow]struct{}
 	// balloonTarget 是最近一条托盘提示对应的文件，点击提示时在资源管理器里选中它。
 	balloonTarget string
 	// ocr 管理高精度识别引擎的下载、加载与释放。
@@ -110,6 +111,7 @@ func NewApp() (*App, error) {
 		pins:          map[*pinWindow]struct{}{},
 		viewers:       map[*longViewer]struct{}{},
 		textWindows:   map[*textWindow]struct{}{},
+		pickers:       map[*pickerWindow]struct{}{},
 		ocr:           &ocrEngines{},
 	}
 	if settingsErr != nil {

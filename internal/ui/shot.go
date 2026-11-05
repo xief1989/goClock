@@ -64,7 +64,7 @@ func (a *App) onShotDone(res shotResult) {
 	case shotLong:
 		a.startLongShot(res.rect)
 	case shotOCR:
-		a.openTextWindow(textJob{img: res.img})
+		a.openTextPicker(res.img, res.rect.Min)
 	case shotTranslate:
 		a.openTextWindow(textJob{img: res.img, translate: true})
 	case shotRecord:
@@ -131,7 +131,11 @@ func (a *App) pinImage(img *image.RGBA, at image.Point, zoom float64) {
 		copy: func(img *image.RGBA) { a.copyImage(img, false) },
 		save: a.saveImageAs,
 		recognize: func(img *image.RGBA, translate bool) {
-			a.openTextWindow(textJob{img: img, translate: translate})
+			if translate {
+				a.openTextWindow(textJob{img: img, translate: true})
+				return
+			}
+			a.openTextPicker(img, capture.CursorPos())
 		},
 		closed: func(p *pinWindow) { delete(a.pins, p) },
 	})
@@ -164,7 +168,7 @@ func (a *App) showLongResult(img *image.RGBA, rect image.Rectangle) {
 	v, err := newLongViewer(img, rect.Min, viewerActions{
 		copy:      func(img *image.RGBA) { a.copyImage(img, a.settings.AutoSave) },
 		save:      a.saveImageAs,
-		recognize: func(img *image.RGBA) { a.openTextWindow(textJob{img: img}) },
+		recognize: func(img *image.RGBA) { a.openTextPicker(img, rect.Min) },
 		pin: func(img *image.RGBA, at image.Point) {
 			// 长图原样钉出来会比屏幕还高，先缩到显示器可用高度的八成以内。
 			work := capture.MonitorAt(at).Work
@@ -202,6 +206,9 @@ func (a *App) closeShots() {
 	}
 	for w := range a.textWindows {
 		w.Close()
+	}
+	for p := range a.pickers {
+		p.Close()
 	}
 }
 

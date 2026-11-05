@@ -52,6 +52,9 @@ type Line struct {
 	Text string
 	// Rect 是这一行在原图中的位置。
 	Rect image.Rectangle
+	// Glyphs 是每个字在原图中的位置，与 []rune(Text) 一一对应，供在图上选字。
+	// 位置是估算的（识别器只给到词或整段），误差在一个字以内；拼接时补的空格对应两字之间的空隙。
+	Glyphs []image.Rectangle
 }
 
 // Result 是一次识别的结果。
@@ -234,6 +237,8 @@ type ocrRect struct {
 type word struct {
 	text string
 	rect ocrRect
+	// glyphs 是词里每个字在原图中的位置，与 []rune(text) 一一对应；为空时按 rect 等分估算。
+	glyphs []image.Rectangle
 }
 
 // readLines 从 OcrResult 中逐行逐词读出文字与位置。
@@ -264,8 +269,11 @@ func readLines(result *comObj, t tile) ([]Line, error) {
 		if len(words) == 0 {
 			continue
 		}
-		text, r := joinWords(words)
-		out = append(out, Line{Text: text, Rect: toImageRect(r, t)})
+		for i := range words {
+			words[i].glyphs = splitRect(toImageRect(words[i].rect, t), utf8.RuneCountInString(words[i].text))
+		}
+		text, r, glyphs := joinWords(words)
+		out = append(out, Line{Text: text, Rect: toImageRect(r, t), Glyphs: glyphs})
 	}
 	return mergeRows(out), nil
 }
@@ -297,13 +305,13 @@ func mergeRows(lines []Line) []Line {
 		sortLines(row, func(a, b Line) bool { return a.Rect.Min.X < b.Rect.Min.X })
 		words := make([]word, len(row))
 		for i, l := range row {
-			words[i] = word{text: l.Text, rect: ocrRect{
+			words[i] = word{text: l.Text, glyphs: l.Glyphs, rect: ocrRect{
 				X: float32(l.Rect.Min.X), Y: float32(l.Rect.Min.Y),
 				Width: float32(l.Rect.Dx()), Height: float32(l.Rect.Dy()),
 			}}
 		}
-		text, _ := joinWords(words)
-		out = append(out, Line{Text: text, Rect: rowRect(row)})
+		text, _, glyphs := joinWords(words)
+		out = append(out, Line{Text: text, Rect: rowRect(row), Glyphs: glyphs})
 	}
 	return out
 }
@@ -364,32 +372,76 @@ func readWords(line *comObj) ([]word, error) {
 	return out, nil
 }
 
-// joinWords 把一行里的词拼成文字。
+// joinWords 把一行里的词拼成文字，同时拼出逐字位置（与返回文字的 []rune 一一对应）。
 //
 // 两边都是西文时一律加空格；只要有一边是中日韩文字，就看两个文字框之间的空隙：
 // 空隙超过字高的三分之一才算真的有空格，否则紧挨着拼（去掉识别器在每个汉字之间插的空格）。
-func joinWords(words []word) (string, ocrRect) {
+func joinWords(words []word) (string, ocrRect, []image.Rectangle) {
 	var b strings.Builder
 	r := words[0].rect
 	b.WriteString(words[0].text)
+	glyphs := append([]image.Rectangle(nil), wordGlyphs(words[0])...)
 	for i := 1; i < len(words); i++ {
 		prev, cur := words[i-1], words[i]
 		last, _ := utf8.DecodeLastRuneInString(prev.text)
 		first, _ := utf8.DecodeRuneInString(cur.text)
 		gap := cur.rect.X - (prev.rect.X + prev.rect.Width)
 		height := math.Max(float64(prev.rect.Height), float64(cur.rect.Height))
+		space := false
 		switch {
 		case isCJKPunct(last) || isCJKPunct(first):
 			// 全角标点自带间距，前后都不需要空格。
 		case !isCJK(last) && !isCJK(first):
-			b.WriteByte(' ')
+			space = true
 		case float64(gap) > height/3:
+			space = true
+		}
+		curGlyphs := wordGlyphs(cur)
+		if space {
 			b.WriteByte(' ')
+			left, right := pixelRect(prev.rect), pixelRect(cur.rect)
+			if len(glyphs) > 0 && len(curGlyphs) > 0 {
+				left, right = glyphs[len(glyphs)-1], curGlyphs[0]
+			}
+			glyphs = append(glyphs, gapRect(left, right))
 		}
 		b.WriteString(cur.text)
+		glyphs = append(glyphs, curGlyphs...)
 		r = unionRect(r, cur.rect)
 	}
-	return b.String(), r
+	return b.String(), r, glyphs
+}
+
+// wordGlyphs 返回词里每个字的位置：识别时已经给出就直接用，否则把词框按字数等分。
+func wordGlyphs(w word) []image.Rectangle {
+	n := utf8.RuneCountInString(w.text)
+	if len(w.glyphs) == n {
+		return w.glyphs
+	}
+	return splitRect(pixelRect(w.rect), n)
+}
+
+// splitRect 把矩形按宽度等分成 n 份，用来估算一个词里每个字的位置。
+func splitRect(r image.Rectangle, n int) []image.Rectangle {
+	out := make([]image.Rectangle, n)
+	for i := range out {
+		out[i] = image.Rect(r.Min.X+r.Dx()*i/n, r.Min.Y, r.Min.X+r.Dx()*(i+1)/n, r.Max.Y)
+	}
+	return out
+}
+
+// gapRect 返回相邻两个字之间空隙的位置，给拼接时补的空格用；两字重叠时退化成零宽。
+func gapRect(a, b image.Rectangle) image.Rectangle {
+	x0 := a.Max.X
+	return image.Rectangle{
+		Min: image.Pt(x0, min(a.Min.Y, b.Min.Y)),
+		Max: image.Pt(max(b.Min.X, x0), max(a.Max.Y, b.Max.Y)),
+	}
+}
+
+// pixelRect 把浮点矩形向外取整成像素矩形。
+func pixelRect(r ocrRect) image.Rectangle {
+	return image.Rect(int(r.X), int(r.Y), int(math.Ceil(float64(r.X+r.Width))), int(math.Ceil(float64(r.Y+r.Height))))
 }
 
 // isCJK 判断字符是否是中日韩文字或全角标点。
