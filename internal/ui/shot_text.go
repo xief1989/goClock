@@ -11,7 +11,6 @@ import (
 	dcl "github.com/lxn/walk/declarative"
 
 	"goclock/internal/httpx"
-	"goclock/internal/ocr"
 	"goclock/internal/storage"
 	"goclock/internal/translate"
 )
@@ -37,10 +36,15 @@ type textWindow struct {
 	src       *walk.TextEdit
 	dst       *walk.TextEdit
 	status    *walk.Label
+	note      *walk.Label
 	lang      *walk.ComboBox
 	btnTrans  *walk.PushButton
 	cancelReq context.CancelFunc
+	cancelOCR context.CancelFunc
 }
+
+// noteMaxRunes 是底部提示文字的最大长度，更长的截断，完整内容放在鼠标提示里。
+const noteMaxRunes = 48
 
 // openTextWindow 打开一个识别 / 翻译窗口并按 job 开始工作。
 func (a *App) openTextWindow(job textJob) {
@@ -63,9 +67,11 @@ func (a *App) openTextWindow(job textJob) {
 		Title:    title + " - " + appName,
 		Icon:     iconProperty(),
 		Font:     dcl.Font{Family: uiFontFamily, PointSize: 9},
-		MinSize:  dcl.Size{Width: 480, Height: 420},
-		Size:     dcl.Size{Width: 680, Height: 580},
-		Layout:   dcl.VBox{Margins: dcl.Margins{Left: 12, Top: 10, Right: 12, Bottom: 10}, Spacing: 6},
+		// walk 窗口的客户区背景默认为空，标签的 TextColor 会被系统默认色盖掉；显式给个与默认一致的底色，灰字和警告色才生效。
+		Background: dcl.SystemColorBrush{Color: walk.SysColorBtnFace},
+		MinSize:    dcl.Size{Width: 480, Height: 420},
+		Size:       dcl.Size{Width: 680, Height: 580},
+		Layout:     dcl.VBox{Margins: dcl.Margins{Left: 12, Top: 10, Right: 12, Bottom: 10}, Spacing: 6},
 		Children: []dcl.Widget{
 			dcl.Composite{
 				Layout: dcl.HBox{MarginsZero: true, Spacing: 8},
@@ -101,7 +107,7 @@ func (a *App) openTextWindow(job textJob) {
 			dcl.Composite{
 				Layout: dcl.HBox{MarginsZero: true, Spacing: 8},
 				Children: []dcl.Widget{
-					dcl.Label{Text: "识别在本机完成；翻译会把原文发给 Google。", TextColor: colorMuted},
+					dcl.Label{AssignTo: &w.note, Text: "识别在本机完成；翻译会把原文发给 Google。", TextColor: colorMuted},
 					dcl.HSpacer{},
 					dcl.PushButton{Text: "复制译文", MinSize: dcl.Size{Width: 84}, OnClicked: func() { w.copyText(w.dst) }},
 					dcl.PushButton{Text: "关闭", MinSize: dcl.Size{Width: 84}, OnClicked: func() { w.mw.Close() }},
@@ -117,6 +123,9 @@ func (a *App) openTextWindow(job textJob) {
 	w.mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
 		if w.cancelReq != nil {
 			w.cancelReq()
+		}
+		if w.cancelOCR != nil {
+			w.cancelOCR()
 		}
 		delete(a.textWindows, w)
 	})
@@ -138,30 +147,56 @@ func (a *App) openTextWindow(job textJob) {
 }
 
 // recognize 在后台识别图片文字，完成后填进原文框；then 为 true 时接着翻译。
+// 首次用高精度识别时要先下载模型，进度显示在状态栏；关掉窗口会取消下载。
 func (w *textWindow) recognize(img *image.RGBA, then bool) {
+	engine, proxy := w.app.settings.OCREngine, w.app.settings.Proxy
+	ctx, cancel := context.WithCancel(context.Background())
+	w.cancelOCR = cancel
 	w.setBusy("正在识别文字……")
+	report := func(text string) {
+		safeSynchronize(w.mw, func() { w.status.SetText(text) })
+	}
 	go func() {
-		start := time.Now()
-		res, err := ocr.Recognize(img)
-		cost := time.Since(start)
+		out, err := w.app.ocr.recognize(ctx, img, engine, proxy, report)
+		// 不能在协程里 defer cancel()：Synchronize 只是排队，协程先退出就会把 ctx 取消，
+		// 回调里便误以为窗口已关、把结果丢掉。ctx 只由关窗口（Closing）取消，这里在界面线程上判断后再释放。
 		safeSynchronize(w.mw, func() {
+			closed := ctx.Err() != nil
+			cancel()
 			w.setIdle()
+			if closed {
+				return
+			}
+			if out.fallback != "" {
+				w.setWarning("高精度识别不可用，已改用系统 OCR：" + out.fallback)
+			}
 			if err != nil {
 				w.status.SetText("识别失败")
 				setEditText(w.src, "识别失败："+err.Error())
 				return
 			}
-			setEditText(w.src, res.Text)
-			if strings.TrimSpace(res.Text) == "" {
-				w.status.SetText("没有识别到文字")
+			setEditText(w.src, out.res.Text)
+			if strings.TrimSpace(out.res.Text) == "" {
+				w.status.SetText(fmt.Sprintf("没有识别到文字（%s）", out.engine))
 				return
 			}
-			w.status.SetText(fmt.Sprintf("识别完成：%d 行，用时 %.1f 秒", len(res.Lines), cost.Seconds()))
+			w.status.SetText(fmt.Sprintf("识别完成（%s）：%d 行，用时 %.1f 秒", out.engine, len(out.res.Lines), out.cost.Seconds()))
 			if then {
 				w.translate()
 			}
 		})
 	}()
+}
+
+// setWarning 把底部提示换成醒目的警告，过长时截断，完整内容放进鼠标提示。
+func (w *textWindow) setWarning(text string) {
+	short := []rune(text)
+	if len(short) > noteMaxRunes {
+		short = append(short[:noteMaxRunes-1], '…')
+	}
+	w.note.SetText(string(short))
+	w.note.SetToolTipText(text)
+	w.note.SetTextColor(colorWarn)
 }
 
 // translate 把原文框里的文字翻译到译文框。

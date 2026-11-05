@@ -57,6 +57,8 @@ type App struct {
 	textWindows map[*textWindow]struct{}
 	// balloonTarget 是最近一条托盘提示对应的文件，点击提示时在资源管理器里选中它。
 	balloonTarget string
+	// ocr 管理高精度识别引擎的下载、加载与释放。
+	ocr *ocrEngines
 
 	shotAction       *walk.Action
 	stopRecordAction *walk.Action
@@ -70,6 +72,8 @@ type App struct {
 	apiKeyEdit       *walk.LineEdit
 	apiKeyStatus     *walk.Label
 	proxyEdit        *walk.LineEdit
+	ocrCombo         *walk.ComboBox
+	ocrStatus        *walk.Label
 
 	// quitting 用于区分「用户关闭窗口」与「真正退出程序」。
 	// 后台协程会读它，所以用原子变量。
@@ -106,10 +110,12 @@ func NewApp() (*App, error) {
 		pins:          map[*pinWindow]struct{}{},
 		viewers:       map[*longViewer]struct{}{},
 		textWindows:   map[*textWindow]struct{}{},
+		ocr:           &ocrEngines{},
 	}
 	if settingsErr != nil {
 		a.settingsErr = settingsErr.Error()
 	}
+	a.ocr.onDownloaded = func() { safeSynchronize(a.mw, a.refreshOCRStatus) }
 	a.toasts.onClosed = a.onToastClosed
 	a.model = &alarmModel{
 		items:    list,
@@ -384,6 +390,7 @@ func (a *App) quit() {
 	a.pending.Clear()
 	a.toasts.CloseAll()
 	a.closeShots()
+	a.ocr.close()
 	if a.hotkeys != nil {
 		a.hotkeys.Close()
 	}

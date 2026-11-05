@@ -87,6 +87,12 @@ type comObj struct {
 }
 
 // call 调用虚表第 i 个方法，返回 HRESULT。
+//
+// go:uintptrescapes 不能省：参数里的 uintptr(unsafe.Pointer(&x)) 经过这一层中转才到 SyscallN，
+// 编译器只对直接写在 SyscallN 参数里的转换做保护。没有这条指示，栈上的输出变量可能因栈扩容搬家，
+// C 代码把结果写进旧地址；有了它，x 一律分配在堆上并在调用期间存活，与 x/sys/windows 的 Proc.Call 同理。
+//
+//go:uintptrescapes
 func (o *comObj) call(i int, args ...uintptr) uintptr {
 	all := make([]uintptr, 0, len(args)+1)
 	all = append(all, uintptr(unsafe.Pointer(o)))

@@ -34,8 +34,8 @@ func TestJoinWordsRemovesSpacesBetweenHanzi(t *testing.T) {
 func TestPlanTilesUpscalesSmallImage(t *testing.T) {
 	img := image.NewRGBA(image.Rect(0, 0, 300, 40))
 	tiles := planTiles(img, 10000)
-	if len(tiles) != 1 || tiles[0].scale < 2 || tiles[0].img.Rect.Dy() < minSide {
-		t.Fatalf("小图应当放大：%+v", tiles[0].img.Rect)
+	if len(tiles) != 1 || tiles[0].scale < windowsUpscale || tiles[0].img.Rect.Dy() < minSide {
+		t.Fatalf("小图应当放大到短边至少 %d：%+v", minSide, tiles[0].img.Rect)
 	}
 }
 
@@ -104,6 +104,35 @@ func TestRecognizeFile(t *testing.T) {
 	}
 	t.Logf("语言 %s，%d 行，用时 %v", res.Language, len(res.Lines), time.Since(start))
 	t.Logf("\n%s", res.Text)
+}
+
+func TestRecognizeCallsDoNotOverlap(t *testing.T) {
+	// 并发调用 Recognize 必须排队执行：重叠时 WinRT 引擎会死锁，见 recognizeMu。
+	if os.Getenv("GOCLOCK_OCR_IMAGE") == "" {
+		t.Skip("未设置 GOCLOCK_OCR_IMAGE，跳过实机识别")
+	}
+	img := image.NewRGBA(image.Rect(0, 0, 400, 120))
+	for i := range img.Pix {
+		img.Pix[i] = 255
+	}
+	done := make(chan error, 4)
+	for i := 0; i < 4; i++ {
+		go func() {
+			_, err := Recognize(img)
+			done <- err
+		}()
+	}
+	timeout := time.After(60 * time.Second)
+	for i := 0; i < 4; i++ {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("识别失败：%v", err)
+			}
+		case <-timeout:
+			t.Fatal("并发识别 60 秒没有全部完成，可能死锁了")
+		}
+	}
 }
 
 func TestToImageRectUndoesScale(t *testing.T) {

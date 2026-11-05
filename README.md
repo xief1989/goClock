@@ -32,7 +32,7 @@
 - **输出**：双击 / `Enter` 复制到剪贴板（同时提供 PNG 格式，粘到 Office、浏览器不失真）；`Ctrl+S` 另存为；可设置「完成时自动保存」
 - **钉图**：把截图置顶钉在桌面上，拖动移动、滚轮缩放、双击关闭、右键复制 / 保存
 - **长截图**：在框内滚动鼠标滚轮即自动拼接，也可以让程序自动滚动；吸顶导航、底部输入框、固定侧边栏、滚动条都能正确处理
-- **识别文字**：调用 Windows 自带的 OCR，离线识别选区（或钉图、长图）里的文字，结果可编辑、可复制
+- **识别文字**：默认用 PaddleOCR（PP-OCRv5）高精度识别，离线识别选区（或钉图、长图）里的文字，结果可编辑、可复制；也可以换成 Windows 自带的 OCR
 - **翻译**：把识别出的文字或任意粘贴的文字交给 Google 翻译，默认中文译成英文、其他语言译成中文
 - **录屏**：把选区录成 MP4（H.264，无声音），可暂停，帧率与是否录鼠标指针可设置
 
@@ -88,10 +88,17 @@
 
 ### 识别文字与翻译
 
-- 识别用 Windows 自带的 OCR，**图片不出本机**；识别语言跟随系统语言（简体中文识别器也认英文和数字）。
-  纯英文想更准，可以用管理员权限装英文识别包：`Add-WindowsCapability -Online -Name "Language.OCR~~~en-US~0.0.1.0"`
-- 屏幕上的小字号会先放大 3 倍再识别，长图会切块识别；整页长图要几秒钟
-- 已知短板：只有一两个字的短行、彩色粗体标题偶尔认不全，可以在结果框里直接改
+- 识别在本机完成，**图片不出本机**。有两个引擎，在「截图设置」的「识别引擎」里切换：
+  - **高精度（默认）**：PaddleOCR PP-OCRv5 移动版模型，经 ONNX Runtime 推理。对话截图实测错字率 1.2%（系统 OCR 为 14%），
+    中英混排时单词之间的空格也能保留。首次使用时自动下载约 33 MB（ONNX Runtime 运行库与检测、识别两个模型）
+    到 `%LOCALAPPDATA%\GoClock\ocr\`，版本固定、逐个校验 SHA256：运行库取自 PyPI 上微软发布的 onnxruntime 安装包
+    （官方源不通时换腾讯云镜像），模型取自魔搭上的 RapidOCR 仓库。下载跟随「网络代理」设置。
+    加载后常驻内存，闲置 5 分钟自动释放
+  - **系统自带**：Windows OCR，不用下载、速度快，精度一般；识别语言跟随系统语言（简体中文识别器也认英文和数字）。
+    纯英文想更准，可以用管理员权限装英文识别包：`Add-WindowsCapability -Online -Name "Language.OCR~~~en-US~0.0.1.0"`
+- 高精度引擎下载或加载失败时自动改用系统 OCR，结果窗口底部写明原因；下载失败后 10 分钟内不再重试，免得每次识别都等网络超时
+- 长图会切块识别。高精度引擎逐行识别，状态栏显示进度，约 300 行的整页长图十几秒；系统 OCR 会先放大 1.5 倍再识别，几秒钟
+- 系统 OCR 的已知短板：只有一两个字的短行、彩色粗体标题偶尔认不全，可以在结果框里直接改
 - **翻译会把文字发给 Google**。默认走免 Key 的接口（非官方，可能被限流）；在「截图设置」里填了 API Key
   就改走官方 Cloud Translation 接口，Key 用 Windows DPAPI 加密后保存，只有当前 Windows 账号能解开
 - 联网默认跟随系统代理（Internet 选项里的手动代理），也可以在设置页手填代理地址；不支持自动配置脚本（PAC）
@@ -177,7 +184,12 @@ internal/
     clipboard.go           图片写入剪贴板（CF_DIB + PNG）
     save.go                PNG 保存与文件命名
     cursor.go              把鼠标指针画进录屏画面
-  ocr/                     Windows 自带 OCR 的 WinRT 最小绑定、切块放大与结果整理（含单元测试）
+  ocr/                     文字识别（含单元测试）
+    paddle.go              PaddleOCR：文字检测、逐行识别、CTC 解码与单词间补空格
+    ort.go                 ONNX Runtime C API 的最小绑定
+    assets.go              高精度识别所需文件的下载、换源与 SHA256 校验
+    winrt.go / ocr.go      Windows 自带 OCR 的 WinRT 最小绑定与结果整理
+    tiles.go               系统 OCR 的切块与放大
   translate/               Google 翻译：免 Key 接口与官方接口（含单元测试）
   httpx/                   按设置或系统代理生成 HTTP 客户端（含单元测试）
   record/                  Media Foundation 的 H.264 / MP4 编码与录制器（含单元测试）
@@ -196,6 +208,7 @@ internal/
     shot_viewer.go         长图预览窗
     shot_pin.go            钉图窗口
     shot_text.go           识别文字与翻译的结果窗口
+    ocr_engine.go          高精度识别引擎的按需下载、缓存、闲置释放与回退到系统 OCR
     shot_record.go         录屏会话：红框与控制条
     win32wnd.go            原生 Win32 窗口与 GDI 的小工具
     gdiplus.go             GDI+ 最小绑定（抗锯齿标注）
@@ -237,8 +250,22 @@ go test ./internal/ui -run TestRenderToastPreview -v
 - **自己的窗口不进截图**：长截图与录屏的边框、面板都设置了 `WDA_EXCLUDEFROMCAPTURE`
 - **输入法**：中文输入法开着时，Esc、C 这些键会被输入法截走，所以遮罩、钉图、预览窗平时不挂输入法，
   只在输入文字标注时临时挂上
-- **OCR 与录屏不引入第三方库**：WinRT（OCR）与 Media Foundation（编码）都是手写的最小 COM 绑定，
-  接口指针一律经输出参数接收，`go vet` 干净；绑定由单元测试与实机测试覆盖（编码测试会生成视频并校验 MP4 结构）
+- **OCR 与录屏不引入第三方 Go 库，也不用 CGO**：WinRT（系统 OCR）、ONNX Runtime 的 C API（高精度 OCR）与
+  Media Foundation（编码）都是手写的最小绑定，接口指针一律经输出参数接收，`go vet` 干净；绑定由单元测试与实机测试覆盖
+  （编码测试会生成视频并校验 MP4 结构）。ONNX Runtime 运行库不随程序分发，首次使用时下载
+- **`//go:uintptrescapes`**：经一层包装函数把 `uintptr(unsafe.Pointer(&out))` 传给系统调用时，包装函数必须加这个标记，
+  否则 `out` 留在栈上，栈扩容搬家后系统写回的是旧地址（曾表现为 ONNX Runtime 推理成功、拿到的输出却是空指针）
+
+高精度识别的验收与实测（默认跳过，需要准备运行库、模型与样图，或允许联网下载；
+验收的样图要与 `paddle_test.go` 里的参考文字 `accuracyTruth` 配套）：
+
+```powershell
+$env:GOCLOCK_PADDLE_DIR = "D:\paddle"; $env:GOCLOCK_ACC_CHAT = "D:\chat.png"
+go test ./internal/ocr -run "TestPaddleAccuracy|TestPaddleReopenAfterClose" -v   # 错字率不超过 3%
+$env:GOCLOCK_LIVE_DOWNLOAD = "1"; $env:GOCLOCK_OCR_IMAGE = "D:\chat.png"
+go test ./internal/ocr -run TestPaddleSourcesLive -v                              # 逐个下载源校验 SHA256
+go test ./internal/ui -run TestOCR -v                                             # 首次下载、闲置释放、下载失败回退
+```
 
 改动标注或工具栏外观时，同样可以离屏渲染成 PNG 查看（含 100% 与 150% 两种缩放）：
 

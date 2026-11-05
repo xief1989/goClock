@@ -10,6 +10,7 @@ import (
 	"math"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -34,6 +35,8 @@ const (
 	recognizeTimeout = 30 * time.Second
 	// minSide 是送去识别的图片最短边：太小的图（例如只框了一行字）先放大，识别率高得多。
 	minSide = 64
+	// windowsUpscale 是送进 Windows 识别器之前的放大倍数，取值依据见 planTiles。
+	windowsUpscale = 1.5
 	// tilePixels 是每块（放大后）的像素预算，块越大识别器的精度越差，见 planTiles。
 	tilePixels = 6_000_000
 	// minTileRows 是每块在原图上至少包含的行数，避免切得过碎。
@@ -61,8 +64,17 @@ type Result struct {
 	Language string
 }
 
-// Recognize 识别图片中的文字。可以在任意协程调用：内部会在一个锁定的系统线程上完成整个识别过程。
+// recognizeMu 让识别一个接一个地进行。
+//
+// 实测：上一次识别还在释放 WinRT 对象时就开始下一次识别，引擎内部会死锁，
+// 识别永远不返回，进程退出时也会卡住。快速连开两个识别窗口就会碰上，所以全部串行。
+var recognizeMu sync.Mutex
+
+// Recognize 识别图片中的文字。可以在任意协程调用：内部会在一个锁定的系统线程上完成整个识别过程，
+// 多次调用会排队，前一次连同资源释放全部完成后才开始下一次。
 func Recognize(img *image.RGBA) (*Result, error) {
+	recognizeMu.Lock()
+	defer recognizeMu.Unlock()
 	type outcome struct {
 		res *Result
 		err error

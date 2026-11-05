@@ -28,7 +28,7 @@ func TestSettingsMissingFileReturnsDefaults(t *testing.T) {
 
 func TestSettingsRoundTrip(t *testing.T) {
 	s := newTestSettingsStore(t)
-	want := Settings{ShotHotkey: "Ctrl+Shift+X", SaveDir: `D:\shots`, AutoSave: true}
+	want := Settings{ShotHotkey: "Ctrl+Shift+X", SaveDir: `D:\shots`, AutoSave: true, OCREngine: OCREngineWindows}
 	if err := s.Save(want); err != nil {
 		t.Fatalf("保存失败：%v", err)
 	}
@@ -67,7 +67,8 @@ func TestSettingsMissingFieldUsesDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("带 BOM 的设置应当能读：%v", err)
 	}
-	if got.ShotHotkey != DefaultShotHotkey || !got.AutoSave {
+	// 旧版本写出的文件没有 ocrEngine，读回来应是默认的高精度识别。
+	if got.ShotHotkey != DefaultShotHotkey || !got.AutoSave || got.OCREngine != "" {
 		t.Errorf("读回内容不对：%+v", got)
 	}
 }

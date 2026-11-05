@@ -12,6 +12,7 @@ import (
 
 	"goclock/internal/hotkey"
 	"goclock/internal/httpx"
+	"goclock/internal/ocr"
 	"goclock/internal/storage"
 	"goclock/internal/translate"
 )
@@ -21,7 +22,7 @@ const shotHelpText = "截图：按热键或点托盘菜单「截图」。鼠标�
 	"选区：拖动边框或手柄调整大小，方向键微调 1 像素，按住 Shift 每次 10 像素。\r\n" +
 	"标注：矩形、椭圆、箭头、画笔、马赛克 / 模糊（可涂抹也可框选）、文字；Ctrl+Z 撤销。\r\n" +
 	"完成：双击选区或按 Enter 复制到剪贴板；Ctrl+S 另存为；Esc 退出；右键先取消选区，再按一次退出。\r\n" +
-	"识别文字 / 翻译：工具栏上的「文」「译」按钮。识别用系统自带的 OCR，在本机完成；翻译会把文字发给 Google。\r\n" +
+	"识别文字 / 翻译：工具栏上的「文」「译」按钮。识别在本机完成，默认用高精度引擎（首次使用自动下载模型，下载不了时改用系统 OCR）；翻译会把文字发给 Google。\r\n" +
 	"录屏：框好区域后点工具栏上的录屏按钮，录成 MP4（无声音），控制条上可暂停、完成或放弃。\r\n" +
 	"取色：放大镜显示时按 C，复制光标处的颜色值（#RRGGBB）。\r\n" +
 	"钉图：截图置顶显示在桌面上，拖动移动、滚轮缩放、双击关闭，右键有更多操作。\r\n" +
@@ -29,6 +30,12 @@ const shotHelpText = "截图：按热键或点托盘菜单「截图」。鼠标�
 
 // recordFPSOptions 是录屏帧率的可选值。
 var recordFPSOptions = []int{15, 24, 30, 60}
+
+// ocrEngineOptions 是识别引擎下拉框的选项，Code 对应 Settings.OCREngine。
+var ocrEngineOptions = []struct{ Code, Name string }{
+	{"", "高精度（PaddleOCR，推荐）"},
+	{storage.OCREngineWindows, "系统自带（Windows OCR）"},
+}
 
 // shotSettingsPage 生成「截图设置」页签。
 func (a *App) shotSettingsPage() dcl.TabPage {
@@ -104,6 +111,20 @@ func (a *App) shotSettingsPage() dcl.TabPage {
 						Checked:          !a.settings.RecordHideCursor,
 						OnCheckedChanged: a.cursorChanged,
 					},
+					dcl.HSpacer{},
+				},
+			}),
+			formRow("识别引擎", dcl.Composite{
+				Layout: dcl.HBox{MarginsZero: true, Spacing: 8},
+				Children: []dcl.Widget{
+					dcl.ComboBox{
+						AssignTo:              &a.ocrCombo,
+						Model:                 ocrEngineNames(),
+						CurrentIndex:          ocrEngineIndex(a.settings.OCREngine),
+						OnCurrentIndexChanged: a.ocrEngineChanged,
+						MinSize:               dcl.Size{Width: 260},
+					},
+					dcl.Label{AssignTo: &a.ocrStatus, TextColor: colorMuted},
 					dcl.HSpacer{},
 				},
 			}),
@@ -194,6 +215,54 @@ func languageIndex(code string) int {
 		}
 	}
 	return 0
+}
+
+// ocrEngineNames 返回识别引擎下拉框的选项文字。
+func ocrEngineNames() []string {
+	names := make([]string, len(ocrEngineOptions))
+	for i, o := range ocrEngineOptions {
+		names[i] = o.Name
+	}
+	return names
+}
+
+// ocrEngineIndex 返回引擎在下拉框中的位置，认不出时指向高精度。
+func ocrEngineIndex(code string) int {
+	for i, o := range ocrEngineOptions {
+		if o.Code == code {
+			return i
+		}
+	}
+	return 0
+}
+
+// ocrEngineChanged 保存识别引擎。
+func (a *App) ocrEngineChanged() {
+	if i := a.ocrCombo.CurrentIndex(); i >= 0 && i < len(ocrEngineOptions) {
+		a.settings.OCREngine = ocrEngineOptions[i].Code
+		a.saveSettings()
+		a.refreshOCRStatus()
+	}
+}
+
+// refreshOCRStatus 显示高精度识别的模型是否已下载。
+func (a *App) refreshOCRStatus() {
+	if a.ocrStatus == nil {
+		return
+	}
+	if a.settings.OCREngine == storage.OCREngineWindows {
+		a.ocrStatus.SetText("速度快、不用下载，精度一般")
+		return
+	}
+	dir, err := ocr.PaddleDir()
+	switch {
+	case err != nil:
+		a.ocrStatus.SetText(err.Error())
+	case ocr.PaddleReady(dir):
+		a.ocrStatus.SetText("模型已下载")
+	default:
+		a.ocrStatus.SetText(fmt.Sprintf("首次识别时自动下载模型（%s）", formatMB(ocr.PaddleDownloadSize(dir))))
+	}
 }
 
 // fpsChanged 保存录屏帧率。
@@ -317,6 +386,7 @@ func (a *App) refreshHotkeyUI() {
 		a.shotAction.SetText(text)
 	}
 	a.refreshAPIKeyStatus()
+	a.refreshOCRStatus()
 }
 
 // browseSaveDir 选择截图保存目录。

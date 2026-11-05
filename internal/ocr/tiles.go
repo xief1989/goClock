@@ -7,20 +7,18 @@ import (
 
 // planTiles 把图片整理成可以送去识别的若干块。
 //
-// 实测（14 像素的微软雅黑正文）：原样送进识别器几乎认不对，放大到 3 倍最稳；
-// 同样的内容整张 10000 像素高送进去，又比切成小块识别差得多。所以先尽量放大到 3 倍，
-// 再按「每块放大后不超过 tilePixels 像素」切块，切口尽量落在空白行上，免得把一行字劈成两半。
-// 识别器对边长还有硬上限 maxDim（通常 10000），太宽的图只能缩小。
+// 实测两类截图：网页正文在原图上几乎认不对、放大后明显变好；聊天界面的中英文混排
+// 放大 3 倍反而比原图差（错字率 28% 对 20%）。1.5 倍在两类图上都接近最好（界面截图 14%），所以统一放大 1.5 倍。
+// 同样的内容整张 10000 像素高送进去，又比切成小块识别差得多，所以再按「每块放大后不超过 tilePixels 像素」切块，
+// 切口尽量落在空白行上，免得把一行字劈成两半。识别器对边长还有硬上限 maxDim（通常 10000），太宽的图只能缩小。
 func planTiles(img *image.RGBA, maxDim int) []tile {
 	w, h := img.Rect.Dx(), img.Rect.Dy()
 	scale := 1.0
 	switch {
 	case w > maxDim:
 		scale = float64(maxDim) / float64(w)
-	case w*3 <= maxDim:
-		scale = 3
-	case w*2 <= maxDim:
-		scale = 2
+	case float64(w)*windowsUpscale <= float64(maxDim):
+		scale = windowsUpscale
 	}
 	if short := float64(min(w, h)) * scale; short < minSide {
 		scale *= minSide / short

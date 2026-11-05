@@ -34,7 +34,7 @@ A small helper that lives in the Windows tray. It currently does two things:
 - **Output** — double-click or `Enter` copies to the clipboard (a PNG flavour is included, so Office and browsers paste it losslessly); `Ctrl+S` saves to a file; optionally save automatically every time.
 - **Pin to desktop** — keeps a screenshot floating on top: drag to move, scroll to zoom, double-click to close, right-click to copy or save.
 - **Scrolling capture** — scroll inside the region and the frames are stitched as you go, or let the program scroll for you. Sticky headers, fixed input bars, fixed sidebars and scrollbars are all handled.
-- **Text recognition** — Windows' built-in OCR reads the text in a selection (or a pinned image, or a long screenshot) offline; the result is editable and copyable.
+- **Text recognition** — reads the text in a selection (or a pinned image, or a long screenshot) offline, using PaddleOCR (PP-OCRv5) by default or Windows' built-in OCR; the result is editable and copyable.
 - **Translation** — recognised text, or anything you paste, goes to Google Translate. By default Chinese becomes English and everything else becomes Chinese.
 - **Screen recording** — records the selection to MP4 (H.264, no audio), with pause; frame rate and whether to draw the pointer are configurable.
 
@@ -90,9 +90,12 @@ Notes:
 
 ### Text recognition and translation
 
-- Recognition uses Windows' built-in OCR, so **the image never leaves the machine**. The recogniser follows the system language (the Simplified Chinese recogniser also reads Latin letters and digits). For better English-only results, install the English OCR pack as administrator: `Add-WindowsCapability -Online -Name "Language.OCR~~~en-US~0.0.1.0"`
-- Small on-screen text is upscaled 3× before recognition, and long images are recognised in tiles; a full-page long screenshot takes a few seconds.
-- Known weak spots: one- or two-character lines and coloured bold headings are sometimes missed — fix them in the result box.
+- Recognition runs locally, so **the image never leaves the machine**. There are two engines, chosen under "Recognition engine" on the screenshot settings tab:
+  - **High accuracy (default)** — the PaddleOCR PP-OCRv5 mobile models, run through ONNX Runtime. On a chat screenshot it measured a 1.2% character error rate (Windows OCR: 14%), and it keeps the spaces between words in mixed Chinese/English text. On first use it downloads about 33 MB (the ONNX Runtime library plus the detection and recognition models) to `%LOCALAPPDATA%\GoClock\ocr\`. Versions are pinned and every file is checked against a SHA256: the library comes from Microsoft's onnxruntime package on PyPI (with the Tencent Cloud mirror as a fallback), the models from the RapidOCR repository on ModelScope. The download honours the proxy setting. Once loaded the engine stays in memory and is released after 5 idle minutes.
+  - **Built-in** — Windows OCR: nothing to download and fast, but less accurate. The recogniser follows the system language (the Simplified Chinese recogniser also reads Latin letters and digits). For better English-only results, install the English OCR pack as administrator: `Add-WindowsCapability -Online -Name "Language.OCR~~~en-US~0.0.1.0"`
+- If the high-accuracy engine can't be downloaded or loaded, recognition falls back to Windows OCR and the result window says why. After a failed download there are no retries for 10 minutes, so each recognition doesn't sit waiting for the network.
+- Long images are recognised in tiles. The high-accuracy engine goes line by line with progress in the status bar; a full-page long screenshot of about 300 lines takes a dozen seconds or so. Windows OCR upscales by 1.5× first and takes a few seconds.
+- Known weak spots of Windows OCR: one- or two-character lines and coloured bold headings are sometimes missed — fix them in the result box.
 - **Translation sends the text to Google.** Without a key it uses the free, unofficial endpoint (which may be rate-limited); with an API key entered on the settings tab it uses the official Cloud Translation API. The key is encrypted with Windows DPAPI and only the current Windows account can decrypt it.
 - Network access follows the system proxy (the manual proxy in Internet Options) unless you enter one on the settings tab; PAC scripts are not supported.
 
@@ -177,7 +180,12 @@ internal/
     clipboard.go           images to the clipboard (CF_DIB + PNG)
     save.go                PNG saving and file naming
     cursor.go              draws the mouse pointer into recorded frames
-  ocr/                     minimal WinRT binding for Windows OCR, tiling/upscaling, result clean-up (unit-tested)
+  ocr/                     text recognition (unit-tested)
+    paddle.go              PaddleOCR: text detection, line recognition, CTC decoding and word spacing
+    ort.go                 minimal binding for the ONNX Runtime C API
+    assets.go              downloading the high-accuracy files, source fallback and SHA256 checks
+    winrt.go / ocr.go      minimal WinRT binding for Windows OCR and result clean-up
+    tiles.go               tiling and upscaling for Windows OCR
   translate/               Google Translate: free endpoint and official API (unit-tested)
   httpx/                   HTTP client using the configured or system proxy (unit-tested)
   record/                  Media Foundation H.264 / MP4 encoder and the recorder (unit-tested)
@@ -196,6 +204,7 @@ internal/
     shot_viewer.go         long-image preview window
     shot_pin.go            pinned image window
     shot_text.go           text recognition / translation result window
+    ocr_engine.go          on-demand download, caching, idle release and Windows OCR fallback for the high-accuracy engine
     shot_record.go         recording session: red frame and control bar
     win32wnd.go            helpers for native Win32 windows and GDI
     gdiplus.go             minimal GDI+ binding (anti-aliased annotations)
@@ -230,7 +239,18 @@ The overlay, pinned images, the scrolling-capture panel and the long-image previ
 - **Anti-aliasing** — the frozen screen is blitted with GDI (fast); annotations are drawn with GDI+ (anti-aliased). The screen and the exported image use the same drawing code.
 - **Our own windows stay out of the picture** — the frames and panels for scrolling capture and recording are marked `WDA_EXCLUDEFROMCAPTURE`.
 - **Input methods** — with a Chinese IME active, keys such as Esc and C are swallowed by the IME, so the overlay, pinned images and the preview window run without an IME, attaching one only while you type a text annotation.
-- **No third-party libraries for OCR and recording** — WinRT (OCR) and Media Foundation (encoding) are reached through small hand-written COM bindings that receive interface pointers via out-parameters, keeping `go vet` clean. They are covered by unit and on-machine tests (the encoder test writes a video and checks its MP4 structure).
+- **No third-party Go libraries and no CGO for OCR and recording** — WinRT (Windows OCR), the ONNX Runtime C API (high-accuracy OCR) and Media Foundation (encoding) are reached through small hand-written bindings that receive interface pointers via out-parameters, keeping `go vet` clean. They are covered by unit and on-machine tests (the encoder test writes a video and checks its MP4 structure). The ONNX Runtime library isn't shipped with the program; it is downloaded on first use.
+- **`//go:uintptrescapes`** — when a wrapper function passes `uintptr(unsafe.Pointer(&out))` on to a system call, the wrapper needs this directive. Without it `out` stays on the stack, and once the stack grows and moves, the callee writes to the old address (this once showed up as ONNX Runtime inference succeeding while the output came back as a null pointer).
+
+Acceptance and live tests for high-accuracy recognition (skipped by default; they need the library, models and sample images, or permission to download; the acceptance image must match the reference text `accuracyTruth` in `paddle_test.go`):
+
+```powershell
+$env:GOCLOCK_PADDLE_DIR = "D:\paddle"; $env:GOCLOCK_ACC_CHAT = "D:\chat.png"
+go test ./internal/ocr -run "TestPaddleAccuracy|TestPaddleReopenAfterClose" -v   # character error rate at most 3%
+$env:GOCLOCK_LIVE_DOWNLOAD = "1"; $env:GOCLOCK_OCR_IMAGE = "D:\chat.png"
+go test ./internal/ocr -run TestPaddleSourcesLive -v                              # every download source, SHA256-checked
+go test ./internal/ui -run TestOCR -v                                             # first-use download, idle release, fallback
+```
 
 The toolbar and annotations can be rendered off-screen to PNG too (at 100% and 150%):
 

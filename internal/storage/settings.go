@@ -39,7 +39,14 @@ type Settings struct {
 	GoogleAPIKey string `json:"googleApiKey"`
 	// Proxy 是联网用的代理地址，如 http://127.0.0.1:7890；为空表示跟随系统代理设置。
 	Proxy string `json:"proxy"`
+
+	// OCREngine 是识别文字用的引擎：为空表示高精度的 PaddleOCR（首次使用自动下载，不可用时改用系统 OCR），
+	// OCREngineWindows 表示直接用系统自带的 OCR。
+	OCREngine string `json:"ocrEngine"`
 }
+
+// OCREngineWindows 是 Settings.OCREngine 的取值：直接用系统自带的 OCR。
+const OCREngineWindows = "windows"
 
 // DefaultRecordFPS 是录屏的默认帧率。
 const DefaultRecordFPS = 30
