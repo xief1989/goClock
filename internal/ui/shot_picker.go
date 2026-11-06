@@ -14,6 +14,7 @@ import (
 	"github.com/lxn/win"
 
 	"goclock/internal/capture"
+	"goclock/internal/crashlog"
 )
 
 const (
@@ -752,7 +753,11 @@ func (a *App) openTextPicker(img *image.RGBA, near image.Point) {
 		})
 	}
 	go func() {
-		out, err := a.ocr.recognize(ctx, img, engine, proxy, report)
+		var out ocrOutcome
+		err := crashlog.Guard("识别文字", func() (err error) {
+			out, err = a.ocr.recognize(ctx, img, engine, proxy, report)
+			return err
+		})
 		// 与识别窗口相同：ctx 只由关窗口取消，在界面线程上判断窗口是否已关，再释放 ctx。
 		safeSynchronize(a.mw, func() {
 			closed := ctx.Err() != nil

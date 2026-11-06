@@ -10,6 +10,7 @@ import (
 	"github.com/lxn/walk"
 	dcl "github.com/lxn/walk/declarative"
 
+	"goclock/internal/crashlog"
 	"goclock/internal/httpx"
 	"goclock/internal/storage"
 	"goclock/internal/translate"
@@ -157,7 +158,11 @@ func (w *textWindow) recognize(img *image.RGBA, then bool) {
 		safeSynchronize(w.mw, func() { w.status.SetText(text) })
 	}
 	go func() {
-		out, err := w.app.ocr.recognize(ctx, img, engine, proxy, report)
+		var out ocrOutcome
+		err := crashlog.Guard("识别文字", func() (err error) {
+			out, err = w.app.ocr.recognize(ctx, img, engine, proxy, report)
+			return err
+		})
 		// 不能在协程里 defer cancel()：Synchronize 只是排队，协程先退出就会把 ctx 取消，
 		// 回调里便误以为窗口已关、把结果丢掉。ctx 只由关窗口（Closing）取消，这里在界面线程上判断后再释放。
 		safeSynchronize(w.mw, func() {
@@ -223,14 +228,20 @@ func (w *textWindow) translate() {
 	w.cancelReq = cancel
 	w.setBusy("正在翻译……")
 	go func() {
-		defer cancel()
 		start := time.Now()
-		res, err := client.Translate(ctx, text, target)
+		var res translate.Result
+		err := crashlog.Guard("翻译", func() (err error) {
+			res, err = client.Translate(ctx, text, target)
+			return err
+		})
 		cost := time.Since(start)
+		// 与识别相同，不能在协程里 defer cancel()：否则回调执行时 ctx 总是已取消，翻译出错都会被当成用户取消吞掉。
 		safeSynchronize(w.mw, func() {
+			canceled := ctx.Err() == context.Canceled
+			cancel()
 			w.setIdle()
 			if err != nil {
-				if ctx.Err() == context.Canceled {
+				if canceled {
 					return
 				}
 				w.status.SetText("翻译失败")

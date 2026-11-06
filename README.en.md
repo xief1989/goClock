@@ -140,6 +140,8 @@ If the machine was asleep or switched off when a reminder was due, it still fire
 
 Reminders are stored in `%APPDATA%\GoClock\alarms.json` as readable JSON. You can edit the file by hand; a UTF-8 BOM (which Notepad adds when saving) is tolerated. Program settings (screenshot hotkey, save folder, recording and translation options and so on) live next to it in `settings.json`; the Google API key in it is encrypted. The `app.ico` in the same folder is a generated icon cache — delete it and it will be rebuilt on the next launch.
 
+If the program exits unexpectedly, the stack trace is written to `crash.log` in the same folder; a panic caught during text recognition or translation is logged there too while the program keeps running. Each launch appends a line with the start time and PID, and the file is cleared on the next launch once it exceeds 1 MB. Attach it when reporting a crash.
+
 Screenshots and recordings are saved to `Pictures\GoClock` by default, with names like `GoClock_20261104_153012.png` / `.mp4`.
 
 ## Building
@@ -172,6 +174,7 @@ internal/
   storage/                 JSON persistence for reminders and program settings, DPAPI encryption (unit-tested)
   autostart/               run-at-login via the registry
   single/                  named mutex for single instance, plus a wake-up event
+  crashlog/                crash log: takes over the runtime's crash output, catches panics in recognition / translation goroutines (unit-tested)
   icon/                    draws the clock icon, encodes it as ICO
   hotkey/                  global hotkeys and parsing of "Ctrl+Alt+A" (unit-tested)
   capture/                 screenshot logic with no UI in it

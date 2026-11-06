@@ -10,7 +10,9 @@ import (
 
 	"github.com/lxn/walk"
 
+	"goclock/internal/crashlog"
 	"goclock/internal/single"
+	"goclock/internal/storage"
 	"goclock/internal/ui"
 )
 
@@ -25,6 +27,11 @@ func main() {
 		return
 	}
 	defer inst.Release()
+
+	// 窗口程序没有控制台，崩溃时的调用栈要写进文件才留得下来；打不开日志也不耽误启动。
+	if dir, err := storage.DataDir(); err == nil {
+		_, _ = crashlog.Setup(dir)
+	}
 
 	app, err := ui.NewApp()
 	if err != nil {
